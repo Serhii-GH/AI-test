@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+    command:
+      - watchmedo
+      - auto-restart
+      - --directory=app
+      - --pattern=*.py
+      - --recursive
+      - --debug-force-polling
+      - --
+      - python
+      - -m
+      - app.main
+    restart: unless-stopped
