@@ -7,6 +7,11 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, Message
 from dotenv import load_dotenv
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 dp = Dispatcher()
 
@@ -20,11 +25,13 @@ COMMANDS_DESCRIPTION = (
 
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
+    logger.info("received /start command")
     await message.answer(f"Вітаю! Я ваш Telegram-бот.\n\n{COMMANDS_DESCRIPTION}")
 
 
 @dp.message(Command("help"))
 async def help_handler(message: Message) -> None:
+    logger.info("received /help command")
     await message.answer(COMMANDS_DESCRIPTION)
 
 
@@ -42,9 +49,9 @@ async def main() -> None:
             BotCommand(command="help", description="Переглянути довідку"),
         ]
     )
+    logger.info("bot started")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
