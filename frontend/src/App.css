@@ -20,11 +20,11 @@
   overflow: hidden;
   margin-bottom: 26px;
   padding: 36px 40px;
-  border: 1px solid #313d37;
+  border: 1px solid rgba(230, 205, 157, 0.26);
   border-radius: 26px;
-  background:
-    linear-gradient(115deg, rgba(26, 36, 32, 0.97) 0%, rgba(36, 48, 42, 0.94) 55%, rgba(86, 99, 76, 0.92) 100%);
-  box-shadow: 0 25px 50px rgba(43, 47, 39, 0.2);
+  background: linear-gradient(115deg, rgba(10, 14, 12, 0.91) 0%, rgba(21, 29, 25, 0.85) 58%, rgba(58, 56, 44, 0.78) 100%);
+  box-shadow: 0 25px 50px rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(14px);
 }
 
 .dashboard-header::before {
@@ -135,7 +135,7 @@ p { margin-top: 0; }
 
 h1,
 h2,
-strong { color: #26322e; }
+strong { color: #f6f0e2; }
 
 h1 {
   margin: 10px 0 12px;
@@ -180,10 +180,11 @@ h2 {
 .summary-card,
 .panel,
 .message-card {
-  border: 1px solid rgba(88, 80, 62, 0.14);
+  border: 1px solid rgba(226, 212, 180, 0.19);
   border-radius: 18px;
-  background: rgba(255, 253, 247, 0.88);
-  box-shadow: 0 12px 26px rgba(64, 53, 37, 0.075);
+  background: linear-gradient(145deg, rgba(21, 27, 23, 0.62), rgba(15, 19, 17, 0.5));
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(7px);
 }
 
 .summary-card {
@@ -226,8 +227,8 @@ h2 {
 }
 
 .card-label,
-.panel-kicker { color: #7c7869; }
-.card-note { color: #838071; font-size: 0.82rem; }
+.panel-kicker { color: #c8bda7; }
+.card-note { color: #b8b7aa; font-size: 0.82rem; }
 .income-card { --metric-color: #719273; border-top: 3px solid #719273; }
 .expense-card { --metric-color: #c65b3f; border-top: 3px solid #c65b3f; }
 .balance-card { --metric-color: #49645c; border-top: 3px solid #49645c; }
@@ -239,13 +240,13 @@ h2 {
 }
 
 .panel { padding: 27px; }
-.panel-heading { gap: 16px; padding-bottom: 17px; border-bottom: 1px solid #e8e2d7; }
+.panel-heading { gap: 16px; padding-bottom: 17px; border-bottom: 1px solid rgba(226, 212, 180, 0.16); }
 
 .live-indicator {
   display: flex;
   align-items: center;
   gap: 7px;
-  color: #69776b;
+  color: #b8c1ad;
   font-size: 0.73rem;
   font-weight: 700;
 }
@@ -255,7 +256,7 @@ h2 {
   height: 7px;
   border-radius: 50%;
   background: #719273;
-  box-shadow: 0 0 0 4px #e3ebdf;
+  box-shadow: 0 0 0 4px rgba(113, 146, 115, 0.25);
 }
 
 .bar-chart {
@@ -277,7 +278,7 @@ h2 {
 
 .bar-value {
   overflow: hidden;
-  color: #5a665e;
+  color: #d4d0c1;
   font-size: 0.7rem;
   font-weight: 800;
   text-align: center;
@@ -292,14 +293,15 @@ h2 {
   overflow: hidden;
   border-radius: 4px 4px 0 0;
   background:
-    repeating-linear-gradient(to bottom, #e9e5da 0, #e9e5da 1px, transparent 1px, transparent 45px),
-    #f6f3eb;
+    repeating-linear-gradient(to bottom, rgba(231, 222, 199, 0.15) 0, rgba(231, 222, 199, 0.15) 1px, transparent 1px, transparent 45px),
+    rgba(4, 7, 5, 0.44);
 }
 
 .bar-fill {
   width: 100%;
   min-height: 7%;
   border-radius: 4px 4px 0 0;
+  background: var(--bar-color);
   background: linear-gradient(180deg, color-mix(in srgb, var(--bar-color) 77%, #fff), var(--bar-color));
   box-shadow: inset 0 1px rgba(255, 255, 255, 0.45);
   transition: height 420ms cubic-bezier(.2, .8, .2, 1);
@@ -308,7 +310,7 @@ h2 {
 .bar-label {
   display: -webkit-box;
   overflow: hidden;
-  color: #767465;
+  color: #c6c2b6;
   font-size: 0.68rem;
   line-height: 1.28;
   text-align: center;
@@ -321,10 +323,10 @@ h2 {
   min-width: 29px;
   min-height: 29px;
   place-items: center;
-  border: 1px solid #dfd2bc;
+  border: 1px solid rgba(225, 190, 132, 0.36);
   border-radius: 50%;
-  background: #f4ecde;
-  color: #9c6239;
+  background: rgba(198, 91, 63, 0.2);
+  color: #edba7c;
   font-size: 0.75rem;
   font-weight: 800;
 }
@@ -339,7 +341,7 @@ h2 {
   width: 100%;
   min-width: 760px;
   border-collapse: collapse;
-  color: #403f37;
+  color: #eee9dc;
   font-size: 0.83rem;
 }
 
@@ -354,8 +356,8 @@ h2 {
 
 .transaction-table th {
   padding: 13px 14px 12px;
-  border-bottom: 1px solid #dfd9cd;
-  color: #847e6d;
+  border-bottom: 1px solid rgba(226, 212, 180, 0.18);
+  color: #bfb6a2;
   font-size: 0.66rem;
   font-weight: 800;
   letter-spacing: 0.1em;
@@ -367,7 +369,7 @@ h2 {
 .transaction-table td {
   max-width: 230px;
   padding: 14px;
-  border-bottom: 1px solid #ece7dd;
+  border-bottom: 1px solid rgba(226, 212, 180, 0.11);
   vertical-align: middle;
 }
 
@@ -375,10 +377,10 @@ h2 {
   transition: background 150ms ease;
 }
 
-.transaction-table tbody tr:hover { background: #f8f3e9; }
+.transaction-table tbody tr:hover { background: rgba(231, 213, 178, 0.08); }
 .transaction-table tbody tr:last-child td { border-bottom: 0; }
-.date-cell { color: #777568; white-space: nowrap; }
-.position-cell { color: #303c36; font-weight: 650; }
+.date-cell { color: #c2c0b7; white-space: nowrap; }
+.position-cell { color: #fffaf0; font-weight: 650; }
 
 .type-pill {
   display: inline-flex;
@@ -390,11 +392,11 @@ h2 {
   white-space: nowrap;
 }
 
-.expense-pill { background: #f7e2db; color: #a74530; }
-.income-pill { background: #e2ebdf; color: #496e4d; }
+.expense-pill { background: rgba(198, 91, 63, 0.24); color: #f0a793; }
+.income-pill { background: rgba(113, 146, 115, 0.25); color: #b5d3b5; }
 .amount-heading, .table-amount { text-align: right !important; }
-.table-amount { color: #b64b35; font-weight: 800; white-space: nowrap; }
-.income-amount { color: #537757; }
+.table-amount { color: #f09a83; font-weight: 800; white-space: nowrap; }
+.income-amount { color: #b5d3b5; }
 
 .empty-state,
 .chart-placeholder,
@@ -402,21 +404,21 @@ h2 {
   display: grid;
   min-height: 235px;
   place-items: center;
-  color: #8a887e;
+  color: #c2bdaf;
   font-size: 0.88rem;
   text-align: center;
 }
 
 .message-card { margin-bottom: 17px; padding: 27px 30px; }
-.error-card { border-color: #dfb6aa; background: #fff9f5; }
-.error-card h2 { color: #a44230; }
-.error-card p { color: #80645d; }
+.error-card { border-color: rgba(219, 120, 99, 0.55); background: rgba(75, 28, 22, 0.78); }
+.error-card h2 { color: #f0ad9b; }
+.error-card p { color: #e0bbb1; }
 .error-card .hint { margin: 14px 0 22px; font-size: 0.86rem; }
-.error-card code { color: #69534a; }
-.bind-card { border-style: dashed; background: #fbf8f0; }
-.bind-card h2 { color: #4c5a50; }
-.bind-card p { margin-bottom: 0; color: #747266; }
-.bind-card code { color: #a95137; font-weight: 800; }
+.error-card code { color: #f6d1c5; }
+.bind-card { border-style: dashed; background: rgba(32, 38, 32, 0.58); }
+.bind-card h2 { color: #e7dbc3; }
+.bind-card p { margin-bottom: 0; color: #c6c0b2; }
+.bind-card code { color: #edba7c; font-weight: 800; }
 
 @media (max-width: 880px) {
   .dashboard-shell { width: min(100% - 30px, 680px); padding-top: 20px; }
