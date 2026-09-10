@@ -14,6 +14,7 @@ from sqlalchemy import (
     Column,
     UniqueConstraint,
     case,
+    delete,
     desc,
     func,
     select,
@@ -289,8 +290,8 @@ async def save_transaction(
         )
 
 
-async def get_transactions(engine: AsyncEngine) -> list[dict[str, object]]:
-    """Return all transactions, newest first, with their category hierarchy."""
+async def get_transactions(engine: AsyncEngine, telegram_id: int) -> list[dict[str, object]]:
+    """Return one Telegram user's transactions, newest first, with category hierarchy."""
     main_categories = categories.alias("main_categories")
     statement = (
         select(
@@ -305,11 +306,15 @@ async def get_transactions(engine: AsyncEngine) -> list[dict[str, object]]:
             transactions.c.created_at,
         )
         .select_from(
-            transactions.join(categories).outerjoin(
+            transactions.join(users).join(
+                categories,
+                transactions.c.category_id == categories.c.id,
+            ).outerjoin(
                 main_categories,
                 categories.c.parent_id == main_categories.c.id,
             )
         )
+        .where(users.c.telegram_id == telegram_id)
         .order_by(desc(transactions.c.created_at), desc(transactions.c.id))
     )
 
@@ -318,8 +323,8 @@ async def get_transactions(engine: AsyncEngine) -> list[dict[str, object]]:
         return [dict(row) for row in result.mappings().all()]
 
 
-async def get_financial_summary(engine: AsyncEngine) -> dict[str, Decimal]:
-    """Calculate totals and balance from all income and expense transactions."""
+async def get_financial_summary(engine: AsyncEngine, telegram_id: int) -> dict[str, Decimal]:
+    """Calculate totals and balance for one Telegram user."""
     total_income = func.coalesce(
         func.sum(
             case(
@@ -340,7 +345,12 @@ async def get_financial_summary(engine: AsyncEngine) -> dict[str, Decimal]:
     ).label("total_expense")
 
     async with engine.connect() as connection:
-        result = await connection.execute(select(total_income, total_expense))
+        statement = (
+            select(total_income, total_expense)
+            .select_from(transactions.join(users))
+            .where(users.c.telegram_id == telegram_id)
+        )
+        result = await connection.execute(statement)
         row = result.mappings().one()
         income = Decimal(row["total_income"])
         expense = Decimal(row["total_expense"])
@@ -349,3 +359,97 @@ async def get_financial_summary(engine: AsyncEngine) -> dict[str, Decimal]:
             "total_expense": expense,
             "balance": income - expense,
         }
+
+
+async def get_user_transactions(
+    engine: AsyncEngine,
+    telegram_id: int,
+    limit: int = 10,
+) -> list[dict[str, object]]:
+    """Return a Telegram user's most recent transactions with category details."""
+    main_categories = categories.alias("main_categories")
+    statement = (
+        select(
+            transactions.c.id,
+            transactions.c.transaction_type,
+            main_categories.c.name.label("main_category"),
+            categories.c.name.label("subcategory"),
+            transactions.c.amount,
+            transactions.c.description,
+            transactions.c.created_at,
+        )
+        .select_from(
+            transactions.join(users).join(
+                categories,
+                transactions.c.category_id == categories.c.id,
+            ).outerjoin(
+                main_categories,
+                categories.c.parent_id == main_categories.c.id,
+            )
+        )
+        .where(users.c.telegram_id == telegram_id)
+        .order_by(desc(transactions.c.created_at), desc(transactions.c.id))
+        .limit(limit)
+    )
+
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        return [dict(row) for row in result.mappings().all()]
+
+
+async def get_user_transaction(
+    engine: AsyncEngine,
+    telegram_id: int,
+    transaction_id: int,
+) -> dict[str, object] | None:
+    """Return one transaction only when it belongs to the supplied Telegram user."""
+    main_categories = categories.alias("main_categories")
+    statement = (
+        select(
+            transactions.c.id,
+            transactions.c.transaction_type,
+            main_categories.c.name.label("main_category"),
+            categories.c.name.label("subcategory"),
+            transactions.c.amount,
+            transactions.c.description,
+        )
+        .select_from(
+            transactions.join(users).join(
+                categories,
+                transactions.c.category_id == categories.c.id,
+            ).outerjoin(
+                main_categories,
+                categories.c.parent_id == main_categories.c.id,
+            )
+        )
+        .where(
+            users.c.telegram_id == telegram_id,
+            transactions.c.id == transaction_id,
+        )
+    )
+
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        row = result.mappings().one_or_none()
+        return dict(row) if row is not None else None
+
+
+async def delete_user_transaction(
+    engine: AsyncEngine,
+    telegram_id: int,
+    transaction_id: int,
+) -> bool:
+    """Delete a transaction only when it belongs to the supplied Telegram user."""
+    user_id_statement = select(users.c.id).where(users.c.telegram_id == telegram_id).scalar_subquery()
+    statement = (
+        delete(transactions)
+        .where(
+            transactions.c.id == transaction_id,
+            transactions.c.user_id == user_id_statement,
+        )
+        .returning(transactions.c.id)
+    )
+
+    async with engine.begin() as connection:
+        deleted_transaction_id = await connection.scalar(statement)
+        return deleted_transaction_id is not None

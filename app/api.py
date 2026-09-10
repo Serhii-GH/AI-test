@@ -3,7 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -51,14 +51,20 @@ app = FastAPI(title="Apartment Renovation Finance API", lifespan=lifespan)
 
 
 @app.get("/api/transactions", response_model=list[TransactionResponse])
-async def list_transactions(request: Request) -> list[dict[str, object]]:
-    """Return transactions from the database as JSON, newest first."""
+async def list_transactions(
+    request: Request,
+    telegram_id: int = Query(ge=1),
+) -> list[dict[str, object]]:
+    """Return the supplied Telegram user's transactions as JSON, newest first."""
     engine: AsyncEngine = request.app.state.database_engine
-    return await get_transactions(engine)
+    return await get_transactions(engine, telegram_id)
 
 
 @app.get("/api/summary", response_model=FinancialSummaryResponse)
-async def get_summary(request: Request) -> dict[str, Decimal]:
-    """Return the user's financial totals as JSON."""
+async def get_summary(
+    request: Request,
+    telegram_id: int = Query(ge=1),
+) -> dict[str, Decimal]:
+    """Return the supplied Telegram user's financial totals as JSON."""
     engine: AsyncEngine = request.app.state.database_engine
-    return await get_financial_summary(engine)
+    return await get_financial_summary(engine, telegram_id)

@@ -13,6 +13,8 @@ const dateFormatter = new Intl.DateTimeFormat('uk-UA', {
   year: 'numeric',
 })
 
+const barColors = ['#c65b3f', '#d5864c', '#8d9a70', '#556b63', '#b6a176', '#7d6656']
+
 function formatCurrency(value) {
   return currencyFormatter.format(Number(value ?? 0))
 }
@@ -22,12 +24,18 @@ function formatDate(value) {
 }
 
 function App() {
+  const [telegramId, setTelegramId] = useState(() => localStorage.getItem('telegram_id') ?? '')
+  const [telegramIdInput, setTelegramIdInput] = useState(() => localStorage.getItem('telegram_id') ?? '')
   const [summary, setSummary] = useState(null)
   const [transactions, setTransactions] = useState([])
-  const [status, setStatus] = useState('loading')
+  const [status, setStatus] = useState(() => (localStorage.getItem('telegram_id') ? 'loading' : 'idle'))
   const [error, setError] = useState('')
 
   const loadDashboard = useCallback(async (showLoading = true) => {
+    if (!telegramId) {
+      return
+    }
+
     if (showLoading) {
       setStatus('loading')
       setError('')
@@ -35,8 +43,8 @@ function App() {
 
     try {
       const [summaryResponse, transactionsResponse] = await Promise.all([
-        fetch('/api/summary'),
-        fetch('/api/transactions'),
+        fetch(`/api/summary?telegram_id=${encodeURIComponent(telegramId)}`),
+        fetch(`/api/transactions?telegram_id=${encodeURIComponent(telegramId)}`),
       ])
 
       if (!summaryResponse.ok || !transactionsResponse.ok) {
@@ -55,12 +63,31 @@ function App() {
       setStatus('error')
       setError(requestError.message)
     }
-  }, [])
+  }, [telegramId])
 
   useEffect(() => {
+    if (!telegramId) {
+      return undefined
+    }
+
     const loadTimer = window.setTimeout(() => loadDashboard(false), 0)
     return () => window.clearTimeout(loadTimer)
-  }, [loadDashboard])
+  }, [loadDashboard, telegramId])
+
+  function bindTelegramId(event) {
+    event.preventDefault()
+    const normalizedTelegramId = telegramIdInput.trim()
+    if (!/^\d+$/.test(normalizedTelegramId) || normalizedTelegramId === '0') {
+      setError('Введіть коректний Telegram ID із команди /id у боті.')
+      setStatus('error')
+      return
+    }
+
+    localStorage.setItem('telegram_id', normalizedTelegramId)
+    setTelegramId(normalizedTelegramId)
+    setError('')
+    setStatus('loading')
+  }
 
   const categoryTotals = useMemo(() => {
     const totals = new Map()
@@ -91,10 +118,30 @@ function App() {
           <h1>Фінансовий огляд ремонту</h1>
           <p className="subtitle">Контролюйте бюджет, витрати та баланс в одному місці.</p>
         </div>
-        <button className="refresh-button" type="button" onClick={loadDashboard} disabled={isLoading}>
-          {isLoading ? 'Оновлюємо…' : '↻ Оновити дані'}
-        </button>
+        <div className="header-actions">
+          <form className="telegram-form" onSubmit={bindTelegramId}>
+            <label htmlFor="telegram-id">Telegram ID</label>
+            <input
+              id="telegram-id"
+              inputMode="numeric"
+              value={telegramIdInput}
+              onChange={(event) => setTelegramIdInput(event.target.value)}
+              placeholder="Введіть через /id"
+            />
+            <button type="submit">Підключити</button>
+          </form>
+          <button className="refresh-button" type="button" onClick={() => loadDashboard()} disabled={isLoading || !telegramId}>
+            {isLoading ? 'Оновлюємо…' : '↻ Оновити дані'}
+          </button>
+        </div>
       </header>
+
+      {!telegramId && (
+        <section className="message-card bind-card">
+          <h2>Підключіть свій Telegram</h2>
+          <p>Надішліть боту <code>/id</code>, скопіюйте число з відповіді та введіть його у поле Telegram ID вище.</p>
+        </section>
+      )}
 
       {status === 'error' && (
         <section className="message-card error-card" aria-live="polite">
@@ -137,13 +184,16 @@ function App() {
                 <div className="chart-placeholder">Завантажуємо діаграму…</div>
               ) : categoryTotals.length > 0 ? (
                 <div className="bar-chart" aria-label="Стовпчикова діаграма витрат за категоріями">
-                  {categoryTotals.map((category) => (
+                  {categoryTotals.map((category, index) => (
                     <div className="bar-column" key={category.label}>
                       <span className="bar-value">{formatCurrency(category.amount)}</span>
                       <div className="bar-track">
                         <div
                           className="bar-fill"
-                          style={{ height: `${Math.max((category.amount / largestCategoryTotal) * 100, 7)}%` }}
+                          style={{
+                            height: `${Math.max((category.amount / largestCategoryTotal) * 100, 7)}%`,
+                            '--bar-color': barColors[index % barColors.length],
+                          }}
                         />
                       </div>
                       <span className="bar-label">{category.label}</span>
@@ -167,21 +217,42 @@ function App() {
               {isLoading ? (
                 <div className="list-placeholder">Завантажуємо операції…</div>
               ) : transactions.length > 0 ? (
-                <div className="transaction-list">
-                  {transactions.slice(0, 5).map((transaction) => (
-                    <div className="transaction-row" key={transaction.id}>
-                      <div className="category-mark">{transaction.main_category?.[0] ?? '•'}</div>
-                      <div className="transaction-details">
-                        <strong>{transaction.description ?? transaction.subcategory}</strong>
-                        <span>
-                          {transaction.main_category ?? 'Категорія'} · {transaction.subcategory} · {formatDate(transaction.created_at)}
-                        </span>
-                      </div>
-                      <strong className={transaction.transaction_type === 'income' ? 'transaction-amount income-amount' : 'transaction-amount'}>
-                        {transaction.transaction_type === 'income' ? '+' : '−'}{formatCurrency(transaction.amount)}
-                      </strong>
-                    </div>
-                  ))}
+                <div className="transaction-table-wrapper">
+                  <table className="transaction-table">
+                    <caption>Останні фінансові операції</caption>
+                    <thead>
+                      <tr>
+                        <th scope="col">Дата</th>
+                        <th scope="col">Тип</th>
+                        <th scope="col">Категорія</th>
+                        <th scope="col">Підкатегорія</th>
+                        <th scope="col">Позиція</th>
+                        <th scope="col" className="amount-heading">Сума</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {transactions.slice(0, 8).map((transaction) => {
+                        const isIncome = transaction.transaction_type === 'income'
+
+                        return (
+                          <tr key={transaction.id}>
+                            <td className="date-cell">{formatDate(transaction.created_at)}</td>
+                            <td>
+                              <span className={isIncome ? 'type-pill income-pill' : 'type-pill expense-pill'}>
+                                {isIncome ? 'Дохід' : 'Витрата'}
+                              </span>
+                            </td>
+                            <td>{transaction.main_category ?? '—'}</td>
+                            <td>{transaction.subcategory}</td>
+                            <td className="position-cell">{transaction.description ?? '—'}</td>
+                            <td className={isIncome ? 'table-amount income-amount' : 'table-amount'}>
+                              {isIncome ? '+' : '−'}{formatCurrency(transaction.amount)}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
                 </div>
               ) : (
                 <div className="empty-state">Операцій поки немає.</div>

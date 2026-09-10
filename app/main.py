@@ -21,6 +21,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.database import (
     check_database_connection,
     create_database_engine,
+    delete_user_transaction,
+    get_user_transaction,
+    get_user_transactions,
     initialize_database,
     save_transaction,
 )
@@ -39,6 +42,9 @@ COMMANDS_DESCRIPTION = (
     "Доступні команди:\n"
     "/add — додати дохід або витрату покроково\n"
     "/expense — додати операцію покроково\n"
+    "/id — показати ваш Telegram ID\n"
+    "/transactions — показати останні операції\n"
+    "/delete <ID> — видалити операцію\n"
     "/cancel — скасувати поточне введення\n"
     "/help — переглянути довідку"
 )
@@ -62,6 +68,10 @@ class TransactionForm(StatesGroup):
     description = State()
 
 
+class DeleteTransactionForm(StatesGroup):
+    confirmation = State()
+
+
 def transaction_type_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Витрата"), KeyboardButton(text="Дохід")]],
@@ -78,6 +88,27 @@ def main_category_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def delete_confirmation_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Так, видалити"), KeyboardButton(text="Скасувати")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def transaction_type_label(transaction_type: str) -> str:
+    return "Дохід" if transaction_type == "income" else "Витрата"
+
+
+def transaction_details(transaction: dict[str, object]) -> str:
+    return (
+        f"#{transaction['id']} — {transaction_type_label(str(transaction['transaction_type']))}\n"
+        f"{transaction.get('main_category') or 'Категорія'} → {transaction['subcategory']} → "
+        f"{transaction.get('description') or 'Без позиції'}\n"
+        f"{Decimal(str(transaction['amount'])):.2f} грн"
+    )
+
+
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
     logger.info("received /start command")
@@ -88,6 +119,15 @@ async def start_handler(message: Message) -> None:
 async def help_handler(message: Message) -> None:
     logger.info("received /help command")
     await message.answer(COMMANDS_DESCRIPTION)
+
+
+@dp.message(Command("id"))
+async def telegram_id_handler(message: Message) -> None:
+    if message.from_user is None:
+        await message.answer("Не вдалося визначити ваш Telegram ID.")
+        return
+
+    await message.answer(f"Ваш Telegram ID: {message.from_user.id}\nВведіть його у web dashboard для перегляду своїх даних.")
 
 
 @dp.message(Command("cancel"))
@@ -107,6 +147,59 @@ async def start_transaction_handler(message: Message, state: FSMContext) -> None
     await state.clear()
     await state.set_state(TransactionForm.transaction_type)
     await message.answer("Оберіть тип операції: витрата чи дохід?", reply_markup=transaction_type_keyboard())
+
+
+@dp.message(Command("transactions"))
+async def transactions_handler(message: Message) -> None:
+    if database_engine is None or message.from_user is None:
+        await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
+        return
+
+    try:
+        transactions = await get_user_transactions(database_engine, message.from_user.id)
+    except Exception:
+        logger.exception("could not get user transactions")
+        await message.answer("Не вдалося отримати операції. Спробуйте ще раз.")
+        return
+
+    if not transactions:
+        await message.answer("У вас поки немає збережених операцій.")
+        return
+
+    details = "\n\n".join(transaction_details(transaction) for transaction in transactions)
+    await message.answer(f"Останні операції:\n\n{details}\n\nДля видалення: /delete <ID>")
+
+
+@dp.message(Command("delete"))
+async def delete_transaction_handler(message: Message, state: FSMContext) -> None:
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Формат команди: /delete <ID>. Спочатку перегляньте ID через /transactions.")
+        return
+
+    if database_engine is None or message.from_user is None:
+        await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
+        return
+
+    transaction_id = int(parts[1])
+    try:
+        transaction = await get_user_transaction(database_engine, message.from_user.id, transaction_id)
+    except Exception:
+        logger.exception("could not get transaction for deletion")
+        await message.answer("Не вдалося знайти операцію. Спробуйте ще раз.")
+        return
+
+    if transaction is None:
+        await message.answer("Операцію не знайдено або вона не належить вам.")
+        return
+
+    await state.clear()
+    await state.update_data(transaction_id=transaction_id)
+    await state.set_state(DeleteTransactionForm.confirmation)
+    await message.answer(
+        f"Видалити цю операцію?\n\n{transaction_details(transaction)}\n\nЦю дію не можна скасувати.",
+        reply_markup=delete_confirmation_keyboard(),
+    )
 
 
 @dp.message(TransactionForm.transaction_type)
@@ -201,6 +294,41 @@ async def description_handler(message: Message, state: FSMContext) -> None:
     )
 
 
+@dp.message(DeleteTransactionForm.confirmation)
+async def delete_confirmation_handler(message: Message, state: FSMContext) -> None:
+    answer = (message.text or "").strip().casefold()
+    if answer == "скасувати":
+        await state.clear()
+        await message.answer("Видалення скасовано.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    if answer != "так, видалити":
+        await message.answer("Оберіть «Так, видалити» або «Скасувати» кнопкою нижче.", reply_markup=delete_confirmation_keyboard())
+        return
+
+    if database_engine is None or message.from_user is None:
+        await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
+        return
+
+    data = await state.get_data()
+    try:
+        deleted = await delete_user_transaction(
+            database_engine,
+            message.from_user.id,
+            data["transaction_id"],
+        )
+    except Exception:
+        logger.exception("could not delete transaction")
+        await message.answer("Не вдалося видалити операцію. Спробуйте ще раз.")
+        return
+
+    await state.clear()
+    if deleted:
+        await message.answer("Операцію видалено.", reply_markup=ReplyKeyboardRemove())
+    else:
+        await message.answer("Операцію вже видалено або її не знайдено.", reply_markup=ReplyKeyboardRemove())
+
+
 async def main() -> None:
     global database_engine
 
@@ -221,6 +349,9 @@ async def main() -> None:
             BotCommand(command="start", description="Отримати привітання"),
             BotCommand(command="add", description="Додати дохід або витрату"),
             BotCommand(command="expense", description="Додати операцію"),
+            BotCommand(command="id", description="Показати мій Telegram ID"),
+            BotCommand(command="transactions", description="Показати останні операції"),
+            BotCommand(command="delete", description="Видалити операцію за ID"),
             BotCommand(command="cancel", description="Скасувати введення"),
             BotCommand(command="help", description="Переглянути довідку"),
         ]
