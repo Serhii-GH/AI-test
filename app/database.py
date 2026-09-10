@@ -227,15 +227,17 @@ async def initialize_database(engine: AsyncEngine) -> None:
         )
 
 
-async def save_expense(
+async def save_transaction(
     engine: AsyncEngine,
     telegram_id: int,
     username: str | None,
     amount: Decimal,
     main_category_name: str,
     subcategory_name: str,
+    description: str,
+    transaction_type: str,
 ) -> None:
-    """Create an expense in a two-level category hierarchy."""
+    """Create an income or expense in a two-level category hierarchy."""
     async with engine.begin() as connection:
         user_id = await connection.scalar(
             insert(users)
@@ -281,7 +283,8 @@ async def save_expense(
                 user_id=user_id,
                 category_id=subcategory_id,
                 amount=amount,
-                transaction_type="expense",
+                transaction_type=transaction_type,
+                description=description,
             )
         )
 
@@ -294,6 +297,7 @@ async def get_transactions(engine: AsyncEngine) -> list[dict[str, object]]:
             transactions.c.id,
             transactions.c.user_id,
             transactions.c.category_id,
+            transactions.c.transaction_type,
             main_categories.c.name.label("main_category"),
             categories.c.name.label("subcategory"),
             transactions.c.amount,

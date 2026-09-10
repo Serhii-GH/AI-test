@@ -20,6 +20,7 @@ class TransactionResponse(BaseModel):
     id: int
     user_id: int
     category_id: int
+    transaction_type: str
     main_category: str | None
     subcategory: str
     amount: Decimal
@@ -35,7 +36,7 @@ class FinancialSummaryResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_dotenv()
+    load_dotenv(override=True)
     engine = create_database_engine()
     await check_database_connection(engine)
     await initialize_database(engine)
