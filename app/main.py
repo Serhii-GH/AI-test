@@ -5,15 +5,27 @@ from decimal import Decimal, InvalidOperation
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BotCommand, Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BotCommand,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.database import (
     check_database_connection,
     create_database_engine,
+    delete_user_transaction,
+    get_user_transaction,
+    get_user_transactions,
     initialize_database,
-    save_expense,
+    save_transaction,
 )
 
 logging.basicConfig(
@@ -22,21 +34,85 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 database_engine: AsyncEngine | None = None
 
 COMMANDS_DESCRIPTION = (
-    "Я простий Telegram-бот.\n\n"
+    "Я допоможу зберігати фінансові операції ремонту.\n\n"
     "Доступні команди:\n"
-    "/start — отримати це повідомлення\n"
+    "/add — додати дохід або витрату покроково\n"
+    "/expense — додати операцію покроково\n"
+    "/id — показати ваш Telegram ID\n"
+    "/transactions — показати останні операції\n"
+    "/delete <ID> — видалити операцію\n"
+    "/cancel — скасувати поточне введення\n"
     "/help — переглянути довідку"
 )
+
+MAIN_CATEGORIES = {
+    "робота": "Робота",
+    "матеріали": "Матеріали",
+}
+
+TRANSACTION_TYPES = {
+    "витрата": ("expense", "Витрата"),
+    "дохід": ("income", "Дохід"),
+}
+
+
+class TransactionForm(StatesGroup):
+    transaction_type = State()
+    amount = State()
+    main_category = State()
+    subcategory = State()
+    description = State()
+
+
+class DeleteTransactionForm(StatesGroup):
+    confirmation = State()
+
+
+def transaction_type_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Витрата"), KeyboardButton(text="Дохід")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def main_category_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Робота"), KeyboardButton(text="Матеріали")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def delete_confirmation_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Так, видалити"), KeyboardButton(text="Скасувати")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def transaction_type_label(transaction_type: str) -> str:
+    return "Дохід" if transaction_type == "income" else "Витрата"
+
+
+def transaction_details(transaction: dict[str, object]) -> str:
+    return (
+        f"#{transaction['id']} — {transaction_type_label(str(transaction['transaction_type']))}\n"
+        f"{transaction.get('main_category') or 'Категорія'} → {transaction['subcategory']} → "
+        f"{transaction.get('description') or 'Без позиції'}\n"
+        f"{Decimal(str(transaction['amount'])):.2f} грн"
+    )
 
 
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
     logger.info("received /start command")
-    await message.answer(f"Вітаю! Я ваш Telegram-бот.\n\n{COMMANDS_DESCRIPTION}")
+    await message.answer(f"Вітаю!\n\n{COMMANDS_DESCRIPTION}")
 
 
 @dp.message(Command("help"))
@@ -45,54 +121,218 @@ async def help_handler(message: Message) -> None:
     await message.answer(COMMANDS_DESCRIPTION)
 
 
-@dp.message(Command("expense"))
-async def expense_handler(message: Message) -> None:
-    """Save an expense sent as /expense <amount> <category>."""
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) != 3:
-        await message.answer("Формат команди: /expense <сума> <категорія>\nПриклад: /expense 120 кава")
+@dp.message(Command("id"))
+async def telegram_id_handler(message: Message) -> None:
+    if message.from_user is None:
+        await message.answer("Не вдалося визначити ваш Telegram ID.")
+        return
+
+    await message.answer(f"Ваш Telegram ID: {message.from_user.id}\nВведіть його у web dashboard для перегляду своїх даних.")
+
+
+@dp.message(Command("cancel"))
+async def cancel_handler(message: Message, state: FSMContext) -> None:
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("Наразі немає операції для скасування.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    await state.clear()
+    await message.answer("Введення операції скасовано.", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.message(Command("add", "expense"))
+async def start_transaction_handler(message: Message, state: FSMContext) -> None:
+    """Start a guided transaction form."""
+    await state.clear()
+    await state.set_state(TransactionForm.transaction_type)
+    await message.answer("Оберіть тип операції: витрата чи дохід?", reply_markup=transaction_type_keyboard())
+
+
+@dp.message(Command("transactions"))
+async def transactions_handler(message: Message) -> None:
+    if database_engine is None or message.from_user is None:
+        await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
         return
 
     try:
-        amount = Decimal(parts[1].replace(",", "."))
+        transactions = await get_user_transactions(database_engine, message.from_user.id)
+    except Exception:
+        logger.exception("could not get user transactions")
+        await message.answer("Не вдалося отримати операції. Спробуйте ще раз.")
+        return
+
+    if not transactions:
+        await message.answer("У вас поки немає збережених операцій.")
+        return
+
+    details = "\n\n".join(transaction_details(transaction) for transaction in transactions)
+    await message.answer(f"Останні операції:\n\n{details}\n\nДля видалення: /delete <ID>")
+
+
+@dp.message(Command("delete"))
+async def delete_transaction_handler(message: Message, state: FSMContext) -> None:
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Формат команди: /delete <ID>. Спочатку перегляньте ID через /transactions.")
+        return
+
+    if database_engine is None or message.from_user is None:
+        await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
+        return
+
+    transaction_id = int(parts[1])
+    try:
+        transaction = await get_user_transaction(database_engine, message.from_user.id, transaction_id)
+    except Exception:
+        logger.exception("could not get transaction for deletion")
+        await message.answer("Не вдалося знайти операцію. Спробуйте ще раз.")
+        return
+
+    if transaction is None:
+        await message.answer("Операцію не знайдено або вона не належить вам.")
+        return
+
+    await state.clear()
+    await state.update_data(transaction_id=transaction_id)
+    await state.set_state(DeleteTransactionForm.confirmation)
+    await message.answer(
+        f"Видалити цю операцію?\n\n{transaction_details(transaction)}\n\nЦю дію не можна скасувати.",
+        reply_markup=delete_confirmation_keyboard(),
+    )
+
+
+@dp.message(TransactionForm.transaction_type)
+async def transaction_type_handler(message: Message, state: FSMContext) -> None:
+    selected_type = TRANSACTION_TYPES.get((message.text or "").strip().casefold())
+    if selected_type is None:
+        await message.answer("Оберіть «Витрата» або «Дохід» кнопкою нижче.", reply_markup=transaction_type_keyboard())
+        return
+
+    transaction_type, transaction_type_label = selected_type
+    await state.update_data(transaction_type=transaction_type, transaction_type_label=transaction_type_label)
+    await state.set_state(TransactionForm.amount)
+    await message.answer("Вкажіть суму:", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.message(TransactionForm.amount)
+async def amount_handler(message: Message, state: FSMContext) -> None:
+    try:
+        amount = Decimal((message.text or "").replace(",", ".").strip())
     except InvalidOperation:
-        await message.answer("Сума має бути числом. Приклад: /expense 120 кава")
+        await message.answer("Сума має бути числом. Наприклад: 2500 або 2500.50")
         return
 
     if not amount.is_finite() or amount <= 0 or amount.as_tuple().exponent < -2:
         await message.answer("Вкажіть додатну суму не більш ніж з двома знаками після коми.")
         return
 
-    category_name = parts[2].strip()
-    if not category_name or len(category_name) > 100:
-        await message.answer("Назва категорії має містити від 1 до 100 символів.")
+    await state.update_data(amount=str(amount))
+    await state.set_state(TransactionForm.main_category)
+    await message.answer("Оберіть основну категорію: Робота чи Матеріали?", reply_markup=main_category_keyboard())
+
+
+@dp.message(TransactionForm.main_category)
+async def main_category_handler(message: Message, state: FSMContext) -> None:
+    main_category_name = MAIN_CATEGORIES.get((message.text or "").strip().casefold())
+    if main_category_name is None:
+        await message.answer("Оберіть «Робота» або «Матеріали» кнопкою нижче.", reply_markup=main_category_keyboard())
+        return
+
+    await state.update_data(main_category_name=main_category_name)
+    await state.set_state(TransactionForm.subcategory)
+    await message.answer("Вкажіть підкатегорію. Наприклад: Електрика, Сантехніка або Малярка.", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.message(TransactionForm.subcategory)
+async def subcategory_handler(message: Message, state: FSMContext) -> None:
+    subcategory_name = (message.text or "").strip()
+    if not subcategory_name or len(subcategory_name) > 100:
+        await message.answer("Назва підкатегорії має містити від 1 до 100 символів.")
+        return
+
+    await state.update_data(subcategory_name=subcategory_name)
+    await state.set_state(TransactionForm.description)
+    await message.answer("Вкажіть конкретну позицію. Наприклад: Ванна, труба PPR 25 мм або 2 мішка штукатурки.")
+
+
+@dp.message(TransactionForm.description)
+async def description_handler(message: Message, state: FSMContext) -> None:
+    description = (message.text or "").strip()
+    if not description or len(description) > 255:
+        await message.answer("Конкретна позиція має містити від 1 до 255 символів.")
         return
 
     if database_engine is None or message.from_user is None:
-        logger.error("expense command received before database initialization")
+        logger.error("transaction received before database initialization")
         await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
         return
 
+    data = await state.get_data()
+    amount = Decimal(data["amount"])
     try:
-        await save_expense(
+        await save_transaction(
             engine=database_engine,
             telegram_id=message.from_user.id,
             username=message.from_user.username,
             amount=amount,
-            category_name=category_name,
+            main_category_name=data["main_category_name"],
+            subcategory_name=data["subcategory_name"],
+            description=description,
+            transaction_type=data["transaction_type"],
         )
     except Exception:
-        logger.exception("could not save expense")
-        await message.answer("Не вдалося зберегти витрату. Спробуйте ще раз.")
+        logger.exception("could not save transaction")
+        await message.answer("Не вдалося зберегти операцію. Спробуйте ще раз.")
         return
 
-    await message.answer(f"Витрату {amount:.2f} грн у категорії «{category_name}» збережено.")
+    await state.clear()
+    await message.answer(
+        f"{data['transaction_type_label']} {amount:.2f} грн збережено:\n"
+        f"{data['main_category_name']} → {data['subcategory_name']} → {description}",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(DeleteTransactionForm.confirmation)
+async def delete_confirmation_handler(message: Message, state: FSMContext) -> None:
+    answer = (message.text or "").strip().casefold()
+    if answer == "скасувати":
+        await state.clear()
+        await message.answer("Видалення скасовано.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    if answer != "так, видалити":
+        await message.answer("Оберіть «Так, видалити» або «Скасувати» кнопкою нижче.", reply_markup=delete_confirmation_keyboard())
+        return
+
+    if database_engine is None or message.from_user is None:
+        await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
+        return
+
+    data = await state.get_data()
+    try:
+        deleted = await delete_user_transaction(
+            database_engine,
+            message.from_user.id,
+            data["transaction_id"],
+        )
+    except Exception:
+        logger.exception("could not delete transaction")
+        await message.answer("Не вдалося видалити операцію. Спробуйте ще раз.")
+        return
+
+    await state.clear()
+    if deleted:
+        await message.answer("Операцію видалено.", reply_markup=ReplyKeyboardRemove())
+    else:
+        await message.answer("Операцію вже видалено або її не знайдено.", reply_markup=ReplyKeyboardRemove())
 
 
 async def main() -> None:
     global database_engine
 
-    load_dotenv()
+    load_dotenv(override=True)
     token = os.getenv("BOT_TOKEN")
 
     if not token:
@@ -107,6 +347,12 @@ async def main() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Отримати привітання"),
+            BotCommand(command="add", description="Додати дохід або витрату"),
+            BotCommand(command="expense", description="Додати операцію"),
+            BotCommand(command="id", description="Показати мій Telegram ID"),
+            BotCommand(command="transactions", description="Показати останні операції"),
+            BotCommand(command="delete", description="Видалити операцію за ID"),
+            BotCommand(command="cancel", description="Скасувати введення"),
             BotCommand(command="help", description="Переглянути довідку"),
         ]
     )

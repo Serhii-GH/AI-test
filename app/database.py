@@ -3,15 +3,21 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     MetaData,
     Numeric,
     String,
     Table,
     Column,
     UniqueConstraint,
+    case,
+    delete,
+    desc,
     func,
+    select,
     text,
 )
 from sqlalchemy.dialects.postgresql import insert
@@ -34,9 +40,17 @@ categories = Table(
     metadata,
     Column("id", BigInteger, primary_key=True, autoincrement=True),
     Column("user_id", BigInteger, ForeignKey("users.id"), nullable=False),
+    Column("parent_id", BigInteger, ForeignKey("categories.id")),
     Column("name", String(100), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
-    UniqueConstraint("user_id", "name"),
+    UniqueConstraint("user_id", "parent_id", "name", name="uq_categories_user_parent_name"),
+    Index(
+        "uq_main_categories_user_name",
+        "user_id",
+        "name",
+        unique=True,
+        postgresql_where=text("parent_id IS NULL"),
+    ),
 )
 
 transactions = Table(
@@ -46,8 +60,13 @@ transactions = Table(
     Column("user_id", BigInteger, ForeignKey("users.id"), nullable=False),
     Column("category_id", BigInteger, ForeignKey("categories.id"), nullable=False),
     Column("amount", Numeric(12, 2), nullable=False),
+    Column("transaction_type", String(20), nullable=False, server_default="expense"),
     Column("description", String(255)),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    CheckConstraint(
+        "transaction_type IN ('income', 'expense')",
+        name="ck_transactions_transaction_type",
+    ),
 )
 
 
@@ -82,19 +101,144 @@ async def check_database_connection(engine: AsyncEngine) -> None:
 
 
 async def initialize_database(engine: AsyncEngine) -> None:
-    """Create the application's tables when they do not exist yet."""
+    """Create tables and upgrade the category hierarchy when necessary."""
     async with engine.begin() as connection:
+        # `create_all` does not add columns to a table created by an earlier
+        # application version. Add the column first so existing databases can
+        # safely receive the new hierarchy.
+        await connection.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF to_regclass('categories') IS NOT NULL THEN
+                        ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id BIGINT;
+                    END IF;
+
+                    IF to_regclass('transactions') IS NOT NULL THEN
+                        ALTER TABLE transactions
+                            ADD COLUMN IF NOT EXISTS transaction_type VARCHAR(20)
+                            NOT NULL DEFAULT 'expense';
+                    END IF;
+                END $$;
+                """
+            )
+        )
         await connection.run_sync(metadata.create_all)
 
+        # The previous version stored expenses in a flat category structure.
+        # This one-time migration intentionally removes those old transactions,
+        # then records completion so transactions added after the upgrade remain.
+        await connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name VARCHAR(100) PRIMARY KEY,
+                    applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        await connection.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conrelid = 'transactions'::regclass
+                          AND conname = 'ck_transactions_transaction_type'
+                    ) THEN
+                        ALTER TABLE transactions
+                            ADD CONSTRAINT ck_transactions_transaction_type
+                            CHECK (transaction_type IN ('income', 'expense'));
+                    END IF;
+                END $$;
+                """
+            )
+        )
+        migration_name = "category_hierarchy_v1"
+        migration_applied = await connection.scalar(
+            text(
+                """
+                INSERT INTO schema_migrations (name)
+                VALUES (:migration_name)
+                ON CONFLICT (name) DO NOTHING
+                RETURNING name
+                """
+            ),
+            {"migration_name": migration_name},
+        )
+        if migration_applied is not None:
+            await connection.execute(text("DELETE FROM transactions"))
+        await connection.execute(
+            text(
+                """
+                DO $$
+                DECLARE legacy_constraint text;
+                BEGIN
+                    IF to_regclass('categories') IS NULL THEN
+                        RETURN;
+                    END IF;
 
-async def save_expense(
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conrelid = 'categories'::regclass
+                          AND contype = 'f'
+                          AND pg_get_constraintdef(oid) LIKE
+                              'FOREIGN KEY (parent_id) REFERENCES categories(id)%'
+                    ) THEN
+                        ALTER TABLE categories
+                            ADD CONSTRAINT fk_categories_parent
+                            FOREIGN KEY (parent_id) REFERENCES categories(id);
+                    END IF;
+
+                    FOR legacy_constraint IN
+                        SELECT conname
+                        FROM pg_constraint
+                        WHERE conrelid = 'categories'::regclass
+                          AND contype = 'u'
+                          AND pg_get_constraintdef(oid) = 'UNIQUE (user_id, name)'
+                    LOOP
+                        EXECUTE format(
+                            'ALTER TABLE categories DROP CONSTRAINT %I',
+                            legacy_constraint
+                        );
+                    END LOOP;
+
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conrelid = 'categories'::regclass
+                          AND conname = 'uq_categories_user_parent_name'
+                    ) THEN
+                        ALTER TABLE categories
+                            ADD CONSTRAINT uq_categories_user_parent_name
+                            UNIQUE (user_id, parent_id, name);
+                    END IF;
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_main_categories_user_name
+                        ON categories (user_id, name)
+                        WHERE parent_id IS NULL;
+                END $$;
+                """
+            )
+        )
+
+
+async def save_transaction(
     engine: AsyncEngine,
     telegram_id: int,
     username: str | None,
     amount: Decimal,
-    category_name: str,
+    main_category_name: str,
+    subcategory_name: str,
+    description: str,
+    transaction_type: str,
 ) -> None:
-    """Create a user's expense and its category if needed."""
+    """Create an income or expense in a two-level category hierarchy."""
     async with engine.begin() as connection:
         user_id = await connection.scalar(
             insert(users)
@@ -106,12 +250,31 @@ async def save_expense(
             .returning(users.c.id)
         )
 
-        category_id = await connection.scalar(
+        main_category_id = await connection.scalar(
             insert(categories)
-            .values(user_id=user_id, name=category_name)
+            .values(user_id=user_id, parent_id=None, name=main_category_name)
             .on_conflict_do_update(
                 index_elements=[categories.c.user_id, categories.c.name],
-                set_={"name": category_name},
+                index_where=categories.c.parent_id.is_(None),
+                set_={"name": main_category_name},
+            )
+            .returning(categories.c.id)
+        )
+
+        subcategory_id = await connection.scalar(
+            insert(categories)
+            .values(
+                user_id=user_id,
+                parent_id=main_category_id,
+                name=subcategory_name,
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    categories.c.user_id,
+                    categories.c.parent_id,
+                    categories.c.name,
+                ],
+                set_={"name": subcategory_name},
             )
             .returning(categories.c.id)
         )
@@ -119,7 +282,174 @@ async def save_expense(
         await connection.execute(
             insert(transactions).values(
                 user_id=user_id,
-                category_id=category_id,
+                category_id=subcategory_id,
                 amount=amount,
+                transaction_type=transaction_type,
+                description=description,
             )
         )
+
+
+async def get_transactions(engine: AsyncEngine, telegram_id: int) -> list[dict[str, object]]:
+    """Return one Telegram user's transactions, newest first, with category hierarchy."""
+    main_categories = categories.alias("main_categories")
+    statement = (
+        select(
+            transactions.c.id,
+            transactions.c.user_id,
+            transactions.c.category_id,
+            transactions.c.transaction_type,
+            main_categories.c.name.label("main_category"),
+            categories.c.name.label("subcategory"),
+            transactions.c.amount,
+            transactions.c.description,
+            transactions.c.created_at,
+        )
+        .select_from(
+            transactions.join(users).join(
+                categories,
+                transactions.c.category_id == categories.c.id,
+            ).outerjoin(
+                main_categories,
+                categories.c.parent_id == main_categories.c.id,
+            )
+        )
+        .where(users.c.telegram_id == telegram_id)
+        .order_by(desc(transactions.c.created_at), desc(transactions.c.id))
+    )
+
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        return [dict(row) for row in result.mappings().all()]
+
+
+async def get_financial_summary(engine: AsyncEngine, telegram_id: int) -> dict[str, Decimal]:
+    """Calculate totals and balance for one Telegram user."""
+    total_income = func.coalesce(
+        func.sum(
+            case(
+                (transactions.c.transaction_type == "income", transactions.c.amount),
+                else_=0,
+            )
+        ),
+        0,
+    ).label("total_income")
+    total_expense = func.coalesce(
+        func.sum(
+            case(
+                (transactions.c.transaction_type == "expense", transactions.c.amount),
+                else_=0,
+            )
+        ),
+        0,
+    ).label("total_expense")
+
+    async with engine.connect() as connection:
+        statement = (
+            select(total_income, total_expense)
+            .select_from(transactions.join(users))
+            .where(users.c.telegram_id == telegram_id)
+        )
+        result = await connection.execute(statement)
+        row = result.mappings().one()
+        income = Decimal(row["total_income"])
+        expense = Decimal(row["total_expense"])
+        return {
+            "total_income": income,
+            "total_expense": expense,
+            "balance": income - expense,
+        }
+
+
+async def get_user_transactions(
+    engine: AsyncEngine,
+    telegram_id: int,
+    limit: int = 10,
+) -> list[dict[str, object]]:
+    """Return a Telegram user's most recent transactions with category details."""
+    main_categories = categories.alias("main_categories")
+    statement = (
+        select(
+            transactions.c.id,
+            transactions.c.transaction_type,
+            main_categories.c.name.label("main_category"),
+            categories.c.name.label("subcategory"),
+            transactions.c.amount,
+            transactions.c.description,
+            transactions.c.created_at,
+        )
+        .select_from(
+            transactions.join(users).join(
+                categories,
+                transactions.c.category_id == categories.c.id,
+            ).outerjoin(
+                main_categories,
+                categories.c.parent_id == main_categories.c.id,
+            )
+        )
+        .where(users.c.telegram_id == telegram_id)
+        .order_by(desc(transactions.c.created_at), desc(transactions.c.id))
+        .limit(limit)
+    )
+
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        return [dict(row) for row in result.mappings().all()]
+
+
+async def get_user_transaction(
+    engine: AsyncEngine,
+    telegram_id: int,
+    transaction_id: int,
+) -> dict[str, object] | None:
+    """Return one transaction only when it belongs to the supplied Telegram user."""
+    main_categories = categories.alias("main_categories")
+    statement = (
+        select(
+            transactions.c.id,
+            transactions.c.transaction_type,
+            main_categories.c.name.label("main_category"),
+            categories.c.name.label("subcategory"),
+            transactions.c.amount,
+            transactions.c.description,
+        )
+        .select_from(
+            transactions.join(users).join(
+                categories,
+                transactions.c.category_id == categories.c.id,
+            ).outerjoin(
+                main_categories,
+                categories.c.parent_id == main_categories.c.id,
+            )
+        )
+        .where(
+            users.c.telegram_id == telegram_id,
+            transactions.c.id == transaction_id,
+        )
+    )
+
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        row = result.mappings().one_or_none()
+        return dict(row) if row is not None else None
+
+
+async def delete_user_transaction(
+    engine: AsyncEngine,
+    telegram_id: int,
+    transaction_id: int,
+) -> bool:
+    """Delete a transaction only when it belongs to the supplied Telegram user."""
+    user_id_statement = select(users.c.id).where(users.c.telegram_id == telegram_id).scalar_subquery()
+    statement = (
+        delete(transactions)
+        .where(
+            transactions.c.id == transaction_id,
+            transactions.c.user_id == user_id_statement,
+        )
+        .returning(transactions.c.id)
+    )
+
+    async with engine.begin() as connection:
+        deleted_transaction_id = await connection.scalar(statement)
+        return deleted_transaction_id is not None
