@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.database import (
     check_database_connection,
+    create_web_login_code,
     create_database_engine,
     delete_user_transaction,
     get_user_transaction,
@@ -43,6 +44,7 @@ COMMANDS_DESCRIPTION = (
     "/add — додати дохід або витрату покроково\n"
     "/expense — додати операцію покроково\n"
     "/id — показати ваш Telegram ID\n"
+    "/login — отримати одноразовий код для входу у web dashboard\n"
     "/transactions — показати останні операції\n"
     "/delete <ID> — видалити операцію\n"
     "/cancel — скасувати поточне введення\n"
@@ -128,6 +130,26 @@ async def telegram_id_handler(message: Message) -> None:
         return
 
     await message.answer(f"Ваш Telegram ID: {message.from_user.id}\nВведіть його у web dashboard для перегляду своїх даних.")
+
+
+@dp.message(Command("login"))
+async def login_handler(message: Message) -> None:
+    """Send a short-lived one-time code for the web dashboard."""
+    if database_engine is None or message.from_user is None:
+        await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
+        return
+
+    try:
+        code = await create_web_login_code(database_engine, message.from_user.id)
+    except Exception:
+        logger.exception("could not create web login code")
+        await message.answer("Не вдалося створити код входу. Спробуйте ще раз.")
+        return
+
+    await message.answer(
+        f"Ваш код для входу у web dashboard: {code}\n\n"
+        "Він дійсний 5 хвилин, одноразовий і має не більше 5 спроб введення."
+    )
 
 
 @dp.message(Command("cancel"))
@@ -350,6 +372,7 @@ async def main() -> None:
             BotCommand(command="add", description="Додати дохід або витрату"),
             BotCommand(command="expense", description="Додати операцію"),
             BotCommand(command="id", description="Показати мій Telegram ID"),
+            BotCommand(command="login", description="Отримати код для web dashboard"),
             BotCommand(command="transactions", description="Показати останні операції"),
             BotCommand(command="delete", description="Видалити операцію за ID"),
             BotCommand(command="cancel", description="Скасувати введення"),
