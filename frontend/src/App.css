@@ -93,7 +93,8 @@
 
 .telegram-form button,
 .refresh-button,
-.retry-button {
+.retry-button,
+.logout-button {
   border: 0;
   border-radius: 8px;
   cursor: pointer;
@@ -167,8 +168,23 @@ h2 {
 }
 
 .refresh-button:hover:not(:disabled),
-.retry-button:hover { background: #a94731; }
+.retry-button:hover,
+.logout-button:hover { background: #a94731; }
 .refresh-button:disabled { cursor: wait; opacity: 0.55; }
+
+.authenticated-user {
+  color: #ddd4bd;
+  font-size: 0.72rem;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.logout-button {
+  padding: 12px 15px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fffaf3;
+  font-size: 0.84rem;
+}
 
 .transaction-form-panel { margin-bottom: 17px; }
 

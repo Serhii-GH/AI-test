@@ -1,5 +1,7 @@
 import os
-from datetime import datetime
+import hashlib
+import secrets
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -8,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     MetaData,
     Numeric,
     String,
@@ -20,6 +23,7 @@ from sqlalchemy import (
     func,
     select,
     text,
+    update,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import URL, make_url
@@ -70,6 +74,28 @@ transactions = Table(
         "transaction_type IN ('income', 'expense')",
         name="ck_transactions_transaction_type",
     ),
+)
+
+web_login_codes = Table(
+    "web_login_codes",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("telegram_id", BigInteger, nullable=False, index=True),
+    Column("code_hash", String(64), nullable=False),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("consumed_at", DateTime(timezone=True)),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+web_sessions = Table(
+    "web_sessions",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("telegram_id", BigInteger, nullable=False, index=True),
+    Column("token_hash", String(64), nullable=False, unique=True),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
 
@@ -315,6 +341,106 @@ async def save_transaction(
         transaction["main_category"] = main_category_name
         transaction["subcategory"] = subcategory_name
         return transaction
+
+
+def _hash_auth_value(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+async def create_web_login_code(engine: AsyncEngine, telegram_id: int) -> str:
+    """Create a one-time six-digit web login code for a Telegram user."""
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(web_login_codes)
+            .where(
+                web_login_codes.c.telegram_id == telegram_id,
+                web_login_codes.c.consumed_at.is_(None),
+            )
+            .values(consumed_at=now)
+        )
+        await connection.execute(
+            insert(web_login_codes).values(
+                telegram_id=telegram_id,
+                code_hash=_hash_auth_value(code),
+                expires_at=now + timedelta(minutes=5),
+            )
+        )
+    return code
+
+
+async def verify_web_login_code(engine: AsyncEngine, telegram_id: int, code: str) -> bool:
+    """Consume a valid code atomically; five incorrect attempts invalidate it."""
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            select(web_login_codes)
+            .where(
+                web_login_codes.c.telegram_id == telegram_id,
+                web_login_codes.c.consumed_at.is_(None),
+            )
+            .order_by(desc(web_login_codes.c.created_at), desc(web_login_codes.c.id))
+            .limit(1)
+            .with_for_update()
+        )
+        login_code = result.mappings().one_or_none()
+        if (
+            login_code is None
+            or login_code["expires_at"] <= now
+            or login_code["attempts"] >= 5
+        ):
+            return False
+
+        if secrets.compare_digest(login_code["code_hash"], _hash_auth_value(code)):
+            await connection.execute(
+                update(web_login_codes)
+                .where(web_login_codes.c.id == login_code["id"])
+                .values(consumed_at=now)
+            )
+            return True
+
+        await connection.execute(
+            update(web_login_codes)
+            .where(web_login_codes.c.id == login_code["id"])
+            .values(attempts=login_code["attempts"] + 1)
+        )
+        return False
+
+
+async def create_web_session(engine: AsyncEngine, telegram_id: int) -> str:
+    """Create a seven-day web session and return its opaque browser token."""
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as connection:
+        await connection.execute(delete(web_sessions).where(web_sessions.c.expires_at <= now))
+        await connection.execute(
+            insert(web_sessions).values(
+                telegram_id=telegram_id,
+                token_hash=_hash_auth_value(token),
+                expires_at=now + timedelta(days=7),
+            )
+        )
+    return token
+
+
+async def get_web_session_telegram_id(engine: AsyncEngine, token: str) -> int | None:
+    """Return the Telegram user for a non-expired browser session token."""
+    statement = select(web_sessions.c.telegram_id).where(
+        web_sessions.c.token_hash == _hash_auth_value(token),
+        web_sessions.c.expires_at > datetime.now(timezone.utc),
+    )
+    async with engine.connect() as connection:
+        telegram_id = await connection.scalar(statement)
+        return int(telegram_id) if telegram_id is not None else None
+
+
+async def delete_web_session(engine: AsyncEngine, token: str) -> None:
+    """Revoke the browser session identified by its opaque token."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            delete(web_sessions).where(web_sessions.c.token_hash == _hash_auth_value(token))
+        )
 
 
 async def get_transactions(engine: AsyncEngine, telegram_id: int) -> list[dict[str, object]]:

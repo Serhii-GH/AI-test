@@ -40,11 +40,14 @@ function formatDate(value) {
 }
 
 function App() {
-  const [telegramId, setTelegramId] = useState(() => localStorage.getItem('telegram_id') ?? '')
-  const [telegramIdInput, setTelegramIdInput] = useState(() => localStorage.getItem('telegram_id') ?? '')
+  const [telegramId, setTelegramId] = useState(null)
+  const [telegramIdInput, setTelegramIdInput] = useState('')
+  const [loginCode, setLoginCode] = useState('')
+  const [authStatus, setAuthStatus] = useState('checking')
+  const [authError, setAuthError] = useState('')
   const [summary, setSummary] = useState(null)
   const [transactions, setTransactions] = useState([])
-  const [status, setStatus] = useState(() => (localStorage.getItem('telegram_id') ? 'loading' : 'idle'))
+  const [status, setStatus] = useState('idle')
   const [error, setError] = useState('')
   const [transactionForm, setTransactionForm] = useState(createEmptyTransactionForm)
   const [transactionError, setTransactionError] = useState('')
@@ -65,8 +68,8 @@ function App() {
 
     try {
       const [summaryResponse, transactionsResponse] = await Promise.all([
-        fetch(`/api/summary?telegram_id=${encodeURIComponent(telegramId)}`),
-        fetch(`/api/transactions?telegram_id=${encodeURIComponent(telegramId)}`),
+        fetch('/api/summary'),
+        fetch('/api/transactions'),
       ])
 
       if (!summaryResponse.ok || !transactionsResponse.ok) {
@@ -88,6 +91,31 @@ function App() {
   }, [telegramId])
 
   useEffect(() => {
+    let isCurrent = true
+
+    async function loadSession() {
+      try {
+        const response = await fetch('/api/auth/session')
+        if (!response.ok) {
+          throw new Error('No active session')
+        }
+        const session = await response.json()
+        if (isCurrent) {
+          setTelegramId(String(session.telegram_id))
+          setAuthStatus('authenticated')
+        }
+      } catch {
+        if (isCurrent) {
+          setAuthStatus('unauthenticated')
+        }
+      }
+    }
+
+    void loadSession()
+    return () => { isCurrent = false }
+  }, [])
+
+  useEffect(() => {
     if (!telegramId) {
       return undefined
     }
@@ -96,19 +124,49 @@ function App() {
     return () => window.clearTimeout(loadTimer)
   }, [loadDashboard, telegramId])
 
-  function bindTelegramId(event) {
+  async function verifyLogin(event) {
     event.preventDefault()
     const normalizedTelegramId = telegramIdInput.trim()
+    const normalizedCode = loginCode.trim()
     if (!/^\d+$/.test(normalizedTelegramId) || normalizedTelegramId === '0') {
-      setError('Введіть коректний Telegram ID із команди /id у боті.')
-      setStatus('error')
+      setAuthError('Введіть коректний Telegram ID.')
+      return
+    }
+    if (!/^\d{6}$/.test(normalizedCode)) {
+      setAuthError('Введіть 6-значний код із Telegram-бота.')
       return
     }
 
-    localStorage.setItem('telegram_id', normalizedTelegramId)
-    setTelegramId(normalizedTelegramId)
-    setError('')
-    setStatus('loading')
+    setAuthStatus('verifying')
+    setAuthError('')
+    try {
+      const response = await fetch('/api/auth/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ telegram_id: Number(normalizedTelegramId), code: normalizedCode }),
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(typeof body?.detail === 'string' ? body.detail : 'Не вдалося підтвердити код.')
+      }
+
+      const session = await response.json()
+      setTelegramId(String(session.telegram_id))
+      setLoginCode('')
+      setAuthStatus('authenticated')
+    } catch (requestError) {
+      setAuthError(requestError.message || 'Не вдалося підтвердити код. Спробуйте ще раз.')
+      setAuthStatus('unauthenticated')
+    }
+  }
+
+  async function logout() {
+    await fetch('/api/auth/logout', { method: 'POST' })
+    setTelegramId(null)
+    setSummary(null)
+    setTransactions([])
+    setStatus('idle')
+    setAuthStatus('unauthenticated')
   }
 
   function updateTransactionForm(event) {
@@ -156,7 +214,6 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          telegram_id: Number(telegramId),
           ...transactionForm,
           amount,
           category,
@@ -190,10 +247,7 @@ function App() {
     setTransactionActionError('')
 
     try {
-      const response = await fetch(
-        `/api/transactions/${transactionId}?telegram_id=${encodeURIComponent(telegramId)}`,
-        { method: 'DELETE' },
-      )
+      const response = await fetch(`/api/transactions/${transactionId}`, { method: 'DELETE' })
 
       if (!response.ok) {
         const responseBody = await response.json().catch(() => null)
@@ -245,27 +299,48 @@ function App() {
           <p className="subtitle">Контролюйте бюджет, витрати та баланс в одному місці.</p>
         </div>
         <div className="header-actions">
-          <form className="telegram-form" onSubmit={bindTelegramId}>
-            <label htmlFor="telegram-id">Telegram ID</label>
-            <input
-              id="telegram-id"
-              inputMode="numeric"
-              value={telegramIdInput}
-              onChange={(event) => setTelegramIdInput(event.target.value)}
-              placeholder="Введіть через /id"
-            />
-            <button type="submit">Підключити</button>
-          </form>
-          <button className="refresh-button" type="button" onClick={() => loadDashboard()} disabled={isLoading || !telegramId}>
-            {isLoading ? 'Оновлюємо…' : '↻ Оновити дані'}
-          </button>
+          {authStatus === 'authenticated' ? (
+            <>
+              <span className="authenticated-user">Telegram ID: {telegramId}</span>
+              <button className="refresh-button" type="button" onClick={() => loadDashboard()} disabled={isLoading}>
+                {isLoading ? 'Оновлюємо…' : '↻ Оновити дані'}
+              </button>
+              <button className="logout-button" type="button" onClick={logout}>Вийти</button>
+            </>
+          ) : (
+            <form className="telegram-form login-form" onSubmit={verifyLogin}>
+              <label htmlFor="telegram-id">Telegram ID</label>
+              <input
+                id="telegram-id"
+                inputMode="numeric"
+                value={telegramIdInput}
+                onChange={(event) => setTelegramIdInput(event.target.value)}
+                placeholder="З команди /id"
+                disabled={authStatus === 'checking' || authStatus === 'verifying'}
+              />
+              <label htmlFor="login-code">Код із бота</label>
+              <input
+                id="login-code"
+                inputMode="numeric"
+                maxLength="6"
+                value={loginCode}
+                onChange={(event) => setLoginCode(event.target.value.replace(/\D/g, ''))}
+                placeholder="000000"
+                disabled={authStatus === 'checking' || authStatus === 'verifying'}
+              />
+              <button type="submit" disabled={authStatus === 'checking' || authStatus === 'verifying'}>
+                {authStatus === 'verifying' ? 'Перевіряємо…' : 'Увійти'}
+              </button>
+            </form>
+          )}
         </div>
       </header>
 
-      {!telegramId && (
+      {authStatus === 'unauthenticated' && (
         <section className="message-card bind-card">
-          <h2>Підключіть свій Telegram</h2>
-          <p>Надішліть боту <code>/id</code>, скопіюйте число з відповіді та введіть його у поле Telegram ID вище.</p>
+          <h2>Увійдіть через Telegram</h2>
+          <p>Надішліть боту <code>/login</code>. Він надішле одноразовий 6-значний код, який дійсний 5 хвилин. Введіть його разом зі своїм Telegram ID вище.</p>
+          {authError && <p className="transaction-form-error" role="alert">{authError}</p>}
         </section>
       )}
 
