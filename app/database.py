@@ -30,6 +30,7 @@ from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 metadata = MetaData()
+DEFAULT_PROJECT_NAME = "Фінансовий огляд ремонту 1-кімнатної квартири в ЖК Нова Англія"
 
 users = Table(
     "users",
@@ -38,6 +39,16 @@ users = Table(
     Column("telegram_id", BigInteger, nullable=False, unique=True),
     Column("username", String(255)),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+projects = Table(
+    "projects",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("user_id", BigInteger, ForeignKey("users.id"), nullable=False),
+    Column("name", String(150), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    UniqueConstraint("user_id", "name", name="uq_projects_user_name"),
 )
 
 categories = Table(
@@ -63,6 +74,7 @@ transactions = Table(
     metadata,
     Column("id", BigInteger, primary_key=True, autoincrement=True),
     Column("user_id", BigInteger, ForeignKey("users.id"), nullable=False),
+    Column("project_id", BigInteger, ForeignKey("projects.id"), nullable=False),
     Column("category_id", BigInteger, ForeignKey("categories.id"), nullable=False),
     Column("amount", Numeric(12, 2), nullable=False),
     Column("exchange_rate", Numeric(10, 4)),
@@ -156,6 +168,8 @@ async def initialize_database(engine: AsyncEngine) -> None:
                             ADD COLUMN IF NOT EXISTS exchange_rate NUMERIC(10, 4);
                         ALTER TABLE transactions
                             ADD COLUMN IF NOT EXISTS amount_usd NUMERIC(12, 2);
+                        ALTER TABLE transactions
+                            ADD COLUMN IF NOT EXISTS project_id BIGINT;
                     END IF;
                 END $$;
                 """
@@ -173,6 +187,57 @@ async def initialize_database(engine: AsyncEngine) -> None:
                     name VARCHAR(100) PRIMARY KEY,
                     applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
                 )
+                """
+            )
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO schema_migrations (name)
+                VALUES ('project_scoping_v1')
+                ON CONFLICT (name) DO NOTHING
+                """
+            )
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO projects (user_id, name)
+                SELECT id, :project_name FROM users
+                ON CONFLICT (user_id, name) DO NOTHING
+                """
+            ),
+            {"project_name": DEFAULT_PROJECT_NAME},
+        )
+        await connection.execute(
+            text(
+                """
+                UPDATE transactions AS transaction
+                SET project_id = project.id
+                FROM projects AS project
+                WHERE transaction.project_id IS NULL
+                  AND project.user_id = transaction.user_id
+                  AND project.name = :project_name
+                """
+            ),
+            {"project_name": DEFAULT_PROJECT_NAME},
+        )
+        await connection.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conrelid = 'transactions'::regclass
+                          AND conname = 'fk_transactions_project'
+                    ) THEN
+                        ALTER TABLE transactions
+                            ADD CONSTRAINT fk_transactions_project
+                            FOREIGN KEY (project_id) REFERENCES projects(id);
+                    END IF;
+                    ALTER TABLE transactions ALTER COLUMN project_id SET NOT NULL;
+                END $$;
                 """
             )
         )
@@ -295,6 +360,7 @@ async def save_transaction(
     transaction_type: str,
     exchange_rate: Decimal | None = None,
     created_at: datetime | None = None,
+    project_id: int | None = None,
 ) -> dict[str, object]:
     """Create an income or expense in a two-level category hierarchy."""
     async with engine.begin() as connection:
@@ -312,6 +378,17 @@ async def save_transaction(
             )
             .returning(users.c.id)
         )
+
+        if project_id is None:
+            project_id = await connection.scalar(
+                insert(projects)
+                .values(user_id=user_id, name=DEFAULT_PROJECT_NAME)
+                .on_conflict_do_update(
+                    index_elements=[projects.c.user_id, projects.c.name],
+                    set_={"name": DEFAULT_PROJECT_NAME},
+                )
+                .returning(projects.c.id)
+            )
 
         main_category_id = await connection.scalar(
             insert(categories)
@@ -344,6 +421,7 @@ async def save_transaction(
 
         transaction_values: dict[str, object] = {
             "user_id": user_id,
+            "project_id": project_id,
             "category_id": subcategory_id,
             "amount": amount,
             "transaction_type": transaction_type,
@@ -364,6 +442,7 @@ async def save_transaction(
             .returning(
                 transactions.c.id,
                 transactions.c.user_id,
+                transactions.c.project_id,
                 transactions.c.category_id,
                 transactions.c.transaction_type,
                 transactions.c.amount,
@@ -471,6 +550,18 @@ async def get_web_session_telegram_id(engine: AsyncEngine, token: str) -> int | 
         return int(telegram_id) if telegram_id is not None else None
 
 
+async def get_telegram_user_profile(
+    engine: AsyncEngine,
+    telegram_id: int,
+) -> dict[str, object] | None:
+    """Return the display data stored for one Telegram user."""
+    statement = select(users.c.telegram_id, users.c.username).where(users.c.telegram_id == telegram_id)
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        row = result.mappings().one_or_none()
+        return dict(row) if row is not None else None
+
+
 async def delete_web_session(engine: AsyncEngine, token: str) -> None:
     """Revoke the browser session identified by its opaque token."""
     async with engine.begin() as connection:
@@ -479,13 +570,87 @@ async def delete_web_session(engine: AsyncEngine, token: str) -> None:
         )
 
 
-async def get_transactions(engine: AsyncEngine, telegram_id: int) -> list[dict[str, object]]:
-    """Return one Telegram user's transactions, newest first, with category hierarchy."""
+async def list_user_projects(engine: AsyncEngine, telegram_id: int) -> list[dict[str, object]]:
+    """Return all finance projects available to one Telegram user."""
+    statement = (
+        select(projects.c.id, projects.c.name, projects.c.created_at)
+        .select_from(projects.join(users))
+        .where(users.c.telegram_id == telegram_id)
+        .order_by(projects.c.created_at, projects.c.id)
+    )
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        return [dict(row) for row in result.mappings().all()]
+
+
+async def get_user_project(
+    engine: AsyncEngine,
+    telegram_id: int,
+    project_id: int,
+) -> dict[str, object] | None:
+    """Return a project only when it belongs to the supplied Telegram user."""
+    statement = (
+        select(projects.c.id, projects.c.name, projects.c.created_at)
+        .select_from(projects.join(users))
+        .where(users.c.telegram_id == telegram_id, projects.c.id == project_id)
+    )
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        row = result.mappings().one_or_none()
+        return dict(row) if row is not None else None
+
+
+async def create_user_project(
+    engine: AsyncEngine,
+    telegram_id: int,
+    name: str,
+) -> dict[str, object] | None:
+    """Create a project for one Telegram user, or return None for a duplicate name."""
+    async with engine.begin() as connection:
+        user_id = await connection.scalar(
+            insert(users)
+            .values(telegram_id=telegram_id)
+            .on_conflict_do_nothing(index_elements=[users.c.telegram_id])
+            .returning(users.c.id)
+        )
+        if user_id is None:
+            user_id = await connection.scalar(
+                select(users.c.id).where(users.c.telegram_id == telegram_id)
+            )
+        result = await connection.execute(
+            insert(projects)
+            .values(user_id=user_id, name=name)
+            .on_conflict_do_nothing(index_elements=[projects.c.user_id, projects.c.name])
+            .returning(projects.c.id, projects.c.name, projects.c.created_at)
+        )
+        row = result.mappings().one_or_none()
+        return dict(row) if row is not None else None
+
+
+async def get_default_project_id(engine: AsyncEngine, telegram_id: int) -> int | None:
+    """Return the project used by Telegram bot commands."""
+    statement = (
+        select(projects.c.id)
+        .select_from(projects.join(users))
+        .where(users.c.telegram_id == telegram_id, projects.c.name == DEFAULT_PROJECT_NAME)
+    )
+    async with engine.connect() as connection:
+        project_id = await connection.scalar(statement)
+        return int(project_id) if project_id is not None else None
+
+
+async def get_transactions(
+    engine: AsyncEngine,
+    telegram_id: int,
+    project_id: int,
+) -> list[dict[str, object]]:
+    """Return one project's transactions, newest first, with category hierarchy."""
     main_categories = categories.alias("main_categories")
     statement = (
         select(
             transactions.c.id,
             transactions.c.user_id,
+            transactions.c.project_id,
             transactions.c.category_id,
             transactions.c.transaction_type,
             main_categories.c.name.label("main_category"),
@@ -505,7 +670,7 @@ async def get_transactions(engine: AsyncEngine, telegram_id: int) -> list[dict[s
                 categories.c.parent_id == main_categories.c.id,
             )
         )
-        .where(users.c.telegram_id == telegram_id)
+        .where(users.c.telegram_id == telegram_id, transactions.c.project_id == project_id)
         .order_by(desc(transactions.c.created_at), desc(transactions.c.id))
     )
 
@@ -514,8 +679,12 @@ async def get_transactions(engine: AsyncEngine, telegram_id: int) -> list[dict[s
         return [dict(row) for row in result.mappings().all()]
 
 
-async def get_financial_summary(engine: AsyncEngine, telegram_id: int) -> dict[str, Decimal]:
-    """Calculate totals and balance for one Telegram user."""
+async def get_financial_summary(
+    engine: AsyncEngine,
+    telegram_id: int,
+    project_id: int,
+) -> dict[str, Decimal]:
+    """Calculate totals and balance for one Telegram user's project."""
     total_income = func.coalesce(
         func.sum(
             case(
@@ -539,7 +708,7 @@ async def get_financial_summary(engine: AsyncEngine, telegram_id: int) -> dict[s
         statement = (
             select(total_income, total_expense)
             .select_from(transactions.join(users))
-            .where(users.c.telegram_id == telegram_id)
+            .where(users.c.telegram_id == telegram_id, transactions.c.project_id == project_id)
         )
         result = await connection.execute(statement)
         row = result.mappings().one()
@@ -557,7 +726,10 @@ async def get_user_transactions(
     telegram_id: int,
     limit: int = 10,
 ) -> list[dict[str, object]]:
-    """Return a Telegram user's most recent transactions with category details."""
+    """Return recent transactions for the Telegram bot's default project."""
+    project_id = await get_default_project_id(engine, telegram_id)
+    if project_id is None:
+        return []
     main_categories = categories.alias("main_categories")
     statement = (
         select(
@@ -580,7 +752,7 @@ async def get_user_transactions(
                 categories.c.parent_id == main_categories.c.id,
             )
         )
-        .where(users.c.telegram_id == telegram_id)
+        .where(users.c.telegram_id == telegram_id, transactions.c.project_id == project_id)
         .order_by(desc(transactions.c.created_at), desc(transactions.c.id))
         .limit(limit)
     )
@@ -595,7 +767,10 @@ async def get_user_transaction(
     telegram_id: int,
     transaction_id: int,
 ) -> dict[str, object] | None:
-    """Return one transaction only when it belongs to the supplied Telegram user."""
+    """Return one transaction only from the Telegram bot's default project."""
+    project_id = await get_default_project_id(engine, telegram_id)
+    if project_id is None:
+        return None
     main_categories = categories.alias("main_categories")
     statement = (
         select(
@@ -620,6 +795,7 @@ async def get_user_transaction(
         .where(
             users.c.telegram_id == telegram_id,
             transactions.c.id == transaction_id,
+            transactions.c.project_id == project_id,
         )
     )
 
@@ -633,14 +809,20 @@ async def delete_user_transaction(
     engine: AsyncEngine,
     telegram_id: int,
     transaction_id: int,
+    project_id: int | None = None,
 ) -> bool:
-    """Delete a transaction only when it belongs to the supplied Telegram user."""
+    """Delete a transaction only when it belongs to the supplied user's project."""
+    if project_id is None:
+        project_id = await get_default_project_id(engine, telegram_id)
+    if project_id is None:
+        return False
     user_id_statement = select(users.c.id).where(users.c.telegram_id == telegram_id).scalar_subquery()
     statement = (
         delete(transactions)
         .where(
             transactions.c.id == transaction_id,
             transactions.c.user_id == user_id_statement,
+            transactions.c.project_id == project_id,
         )
         .returning(transactions.c.id)
     )

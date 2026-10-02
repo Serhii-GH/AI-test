@@ -54,12 +54,19 @@ function formatDate(value) {
 
 function App() {
   const [telegramId, setTelegramId] = useState(null)
+  const [telegramUsername, setTelegramUsername] = useState(null)
+  const [telegramAvatarUrl, setTelegramAvatarUrl] = useState(null)
   const [telegramIdInput, setTelegramIdInput] = useState('')
   const [loginCode, setLoginCode] = useState('')
   const [authStatus, setAuthStatus] = useState('checking')
   const [authError, setAuthError] = useState('')
   const [summary, setSummary] = useState(null)
   const [transactions, setTransactions] = useState([])
+  const [projects, setProjects] = useState([])
+  const [activeProjectId, setActiveProjectId] = useState(null)
+  const [newProjectName, setNewProjectName] = useState('')
+  const [projectError, setProjectError] = useState('')
+  const [isCreatingProject, setIsCreatingProject] = useState(false)
   const [status, setStatus] = useState('idle')
   const [error, setError] = useState('')
   const [transactionForm, setTransactionForm] = useState(createEmptyTransactionForm)
@@ -73,8 +80,29 @@ function App() {
   const [analysisStatus, setAnalysisStatus] = useState('idle')
   const [analysisError, setAnalysisError] = useState('')
 
-  const loadDashboard = useCallback(async (showLoading = true) => {
+  const loadProjects = useCallback(async () => {
     if (!telegramId) {
+      return
+    }
+    try {
+      const response = await fetch('/api/projects')
+      if (!response.ok) {
+        throw new Error('Не вдалося завантажити проєкти.')
+      }
+      const projectData = await response.json()
+      setProjects(projectData)
+      setActiveProjectId((currentProjectId) => (
+        projectData.some((project) => project.id === currentProjectId)
+          ? currentProjectId
+          : projectData[0]?.id ?? null
+      ))
+    } catch (requestError) {
+      setProjectError(requestError.message)
+    }
+  }, [telegramId])
+
+  const loadDashboard = useCallback(async (showLoading = true) => {
+    if (!telegramId || !activeProjectId) {
       return
     }
 
@@ -85,8 +113,8 @@ function App() {
 
     try {
       const [summaryResponse, transactionsResponse] = await Promise.all([
-        fetch('/api/summary'),
-        fetch('/api/transactions'),
+        fetch(`/api/summary?project_id=${activeProjectId}`),
+        fetch(`/api/transactions?project_id=${activeProjectId}`),
       ])
 
       if (!summaryResponse.ok || !transactionsResponse.ok) {
@@ -105,7 +133,7 @@ function App() {
       setStatus('error')
       setError(requestError.message)
     }
-  }, [telegramId])
+  }, [activeProjectId, telegramId])
 
   useEffect(() => {
     let isCurrent = true
@@ -119,6 +147,7 @@ function App() {
         const session = await response.json()
         if (isCurrent) {
           setTelegramId(String(session.telegram_id))
+          setTelegramUsername(session.username ?? null)
           setAuthStatus('authenticated')
         }
       } catch {
@@ -133,13 +162,57 @@ function App() {
   }, [])
 
   useEffect(() => {
+    let avatarUrl = null
+    let isCurrent = true
+
+    async function loadTelegramAvatar() {
+      if (!telegramId) {
+        setTelegramAvatarUrl(null)
+        return
+      }
+
+      try {
+        const response = await fetch('/api/auth/avatar')
+        if (response.status !== 200 || !response.headers.get('content-type')?.startsWith('image/')) {
+          return
+        }
+        avatarUrl = URL.createObjectURL(await response.blob())
+        if (isCurrent) {
+          setTelegramAvatarUrl(avatarUrl)
+        }
+      } catch {
+        if (isCurrent) {
+          setTelegramAvatarUrl(null)
+        }
+      }
+    }
+
+    void loadTelegramAvatar()
+    return () => {
+      isCurrent = false
+      if (avatarUrl) {
+        URL.revokeObjectURL(avatarUrl)
+      }
+    }
+  }, [telegramId])
+
+  useEffect(() => {
     if (!telegramId) {
       return undefined
     }
 
-    const loadTimer = window.setTimeout(() => loadDashboard(false), 0)
+    const loadTimer = window.setTimeout(() => { void loadProjects() }, 0)
     return () => window.clearTimeout(loadTimer)
-  }, [loadDashboard, telegramId])
+  }, [loadProjects, telegramId])
+
+  useEffect(() => {
+    if (!telegramId || !activeProjectId) {
+      return undefined
+    }
+
+    const loadTimer = window.setTimeout(() => { void loadDashboard(false) }, 0)
+    return () => window.clearTimeout(loadTimer)
+  }, [activeProjectId, loadDashboard, telegramId])
 
   async function verifyLogin(event) {
     event.preventDefault()
@@ -169,6 +242,7 @@ function App() {
 
       const session = await response.json()
       setTelegramId(String(session.telegram_id))
+      setTelegramUsername(session.username ?? null)
       setLoginCode('')
       setAuthStatus('authenticated')
     } catch (requestError) {
@@ -180,8 +254,12 @@ function App() {
   async function logout() {
     await fetch('/api/auth/logout', { method: 'POST' })
     setTelegramId(null)
+    setTelegramUsername(null)
+    setTelegramAvatarUrl(null)
     setSummary(null)
     setTransactions([])
+    setProjects([])
+    setActiveProjectId(null)
     setAnalysis(null)
     setAnalysisStatus('idle')
     setStatus('idle')
@@ -191,6 +269,40 @@ function App() {
   function updateTransactionForm(event) {
     const { name, value } = event.target
     setTransactionForm((currentForm) => ({ ...currentForm, [name]: value }))
+  }
+
+  async function createProject(event) {
+    event.preventDefault()
+    const name = newProjectName.trim()
+    if (!name) {
+      setProjectError('Вкажіть назву нового фінансового огляду.')
+      return
+    }
+
+    setIsCreatingProject(true)
+    setProjectError('')
+    try {
+      const response = await fetch('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      if (!response.ok) {
+        const responseBody = await response.json().catch(() => null)
+        throw new Error(typeof responseBody?.detail === 'string' ? responseBody.detail : 'Не вдалося створити проєкт.')
+      }
+      const project = await response.json()
+      setProjects((currentProjects) => [...currentProjects, project])
+      setNewProjectName('')
+      setActiveProjectId(project.id)
+      setAnalysis(null)
+      setAnalysisStatus('idle')
+      setVisibleTransactionLimit(TRANSACTION_PAGE_SIZE)
+    } catch (requestError) {
+      setProjectError(requestError.message || 'Не вдалося створити проєкт. Спробуйте ще раз.')
+    } finally {
+      setIsCreatingProject(false)
+    }
   }
 
   async function submitTransaction(event) {
@@ -245,6 +357,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...transactionForm,
+          project_id: activeProjectId,
           amount,
           exchange_rate: exchangeRate,
           category,
@@ -272,7 +385,7 @@ function App() {
   }
 
   async function deleteTransaction(transactionId) {
-    if (!telegramId || !window.confirm('Видалити операцію?')) {
+    if (!telegramId || !activeProjectId || !window.confirm('Видалити операцію?')) {
       return
     }
 
@@ -280,7 +393,7 @@ function App() {
     setTransactionActionError('')
 
     try {
-      const response = await fetch(`/api/transactions/${transactionId}`, { method: 'DELETE' })
+      const response = await fetch(`/api/transactions/${transactionId}?project_id=${activeProjectId}`, { method: 'DELETE' })
 
       if (!response.ok) {
         const responseBody = await response.json().catch(() => null)
@@ -301,14 +414,14 @@ function App() {
   }
 
   async function runAiAnalysis() {
-    if (!telegramId) {
+    if (!telegramId || !activeProjectId) {
       return
     }
 
     setAnalysisStatus('loading')
     setAnalysisError('')
     try {
-      const response = await fetch('/api/ai/analyze-transactions', { method: 'POST' })
+      const response = await fetch(`/api/ai/analyze-transactions?project_id=${activeProjectId}`, { method: 'POST' })
       if (!response.ok) {
         const responseBody = await response.json().catch(() => null)
         throw new Error(
@@ -362,8 +475,16 @@ function App() {
         <div className="header-actions">
           {authStatus === 'authenticated' ? (
             <>
-              <span className="authenticated-user">Telegram ID: {telegramId}</span>
-              <button className="refresh-button" type="button" onClick={() => loadDashboard()} disabled={isLoading}>
+              <div className="authenticated-user">
+                <span className="user-avatar" aria-hidden="true">
+                  {telegramAvatarUrl ? <img src={telegramAvatarUrl} alt="" /> : '👤'}
+                </span>
+                <span>
+                  <strong>{telegramUsername ? `@${telegramUsername}` : 'Користувач Telegram'}</strong>
+                  <small>Telegram ID: {telegramId}</small>
+                </span>
+              </div>
+              <button className="refresh-button" type="button" onClick={() => loadDashboard()} disabled={isLoading || !activeProjectId}>
                 {isLoading ? 'Оновлюємо…' : '↻ Оновити дані'}
               </button>
               <button className="logout-button" type="button" onClick={logout}>Вийти</button>
@@ -396,6 +517,48 @@ function App() {
           )}
         </div>
       </header>
+
+      {authStatus === 'authenticated' && (
+        <section className="panel project-switcher">
+          <div>
+            <p className="panel-kicker">Фінансові огляди</p>
+            <div className="project-tabs" role="tablist" aria-label="Фінансові проєкти">
+              {projects.map((project) => (
+                <button
+                  className={project.id === activeProjectId ? 'project-tab project-tab-active' : 'project-tab'}
+                  key={project.id}
+                  role="tab"
+                  aria-selected={project.id === activeProjectId}
+                  type="button"
+                  onClick={() => {
+                    setActiveProjectId(project.id)
+                    setAnalysis(null)
+                    setAnalysisStatus('idle')
+                    setVisibleTransactionLimit(TRANSACTION_PAGE_SIZE)
+                  }}
+                >
+                  {project.name}
+                </button>
+              ))}
+            </div>
+          </div>
+          <form className="new-project-form" onSubmit={createProject}>
+            <label htmlFor="new-project-name">Новий огляд</label>
+            <input
+              id="new-project-name"
+              maxLength="150"
+              value={newProjectName}
+              onChange={(event) => setNewProjectName(event.target.value)}
+              placeholder="Наприклад, Будинок у Львові"
+              disabled={isCreatingProject}
+            />
+            <button type="submit" disabled={isCreatingProject}>
+              {isCreatingProject ? 'Створюємо…' : '+ Створити'}
+            </button>
+          </form>
+          {projectError && <p className="transaction-form-error" role="alert">{projectError}</p>}
+        </section>
+      )}
 
       {authStatus === 'unauthenticated' && (
         <section className="message-card bind-card">
@@ -442,7 +605,7 @@ function App() {
             className="ai-analysis-button"
             type="button"
             onClick={runAiAnalysis}
-            disabled={!telegramId || analysisStatus === 'loading'}
+            disabled={!telegramId || !activeProjectId || analysisStatus === 'loading'}
           >
             {analysisStatus === 'loading' ? 'Аналізуємо…' : 'Запустити AI-аналіз'}
           </button>

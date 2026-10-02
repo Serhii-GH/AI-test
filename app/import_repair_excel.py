@@ -17,6 +17,7 @@ from xml.etree import ElementTree
 
 from app.database import (
     create_database_engine,
+    get_default_project_id,
     get_transactions,
     initialize_database,
     save_transaction,
@@ -194,7 +195,10 @@ async def import_records(workbook_path: Path, telegram_id: int, apply_changes: b
     engine = create_database_engine()
     try:
         await initialize_database(engine)
-        existing_transactions = await get_transactions(engine, telegram_id)
+        project_id = await get_default_project_id(engine, telegram_id)
+        if project_id is None:
+            raise RuntimeError("Default project was not created for this Telegram user.")
+        existing_transactions = await get_transactions(engine, telegram_id, project_id)
         existing_fingerprints = {
             _fingerprint(
                 Decimal(str(transaction["amount"])),
