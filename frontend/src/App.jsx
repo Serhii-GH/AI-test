@@ -51,6 +51,7 @@ function App() {
   const [isSubmittingTransaction, setIsSubmittingTransaction] = useState(false)
   const [transactionActionError, setTransactionActionError] = useState('')
   const [deletingTransactionId, setDeletingTransactionId] = useState(null)
+  const [transactionFilter, setTransactionFilter] = useState('all')
 
   const loadDashboard = useCallback(async (showLoading = true) => {
     if (!telegramId) {
@@ -122,6 +123,31 @@ function App() {
       return
     }
 
+    const amount = transactionForm.amount.trim()
+    const category = transactionForm.category.trim()
+    const parsedAmount = Number(amount)
+
+    if (!amount) {
+      setTransactionError('Вкажіть суму операції.')
+      return
+    }
+    if (!Number.isFinite(parsedAmount)) {
+      setTransactionError('Сума має бути числом.')
+      return
+    }
+    if (parsedAmount <= 0) {
+      setTransactionError('Сума має бути більшою за нуль.')
+      return
+    }
+    if (!['income', 'expense'].includes(transactionForm.type)) {
+      setTransactionError('Оберіть коректний тип операції.')
+      return
+    }
+    if (!category) {
+      setTransactionError('Вкажіть категорію операції.')
+      return
+    }
+
     setIsSubmittingTransaction(true)
     setTransactionError('')
 
@@ -132,6 +158,8 @@ function App() {
         body: JSON.stringify({
           telegram_id: Number(telegramId),
           ...transactionForm,
+          amount,
+          category,
         }),
       })
 
@@ -203,6 +231,9 @@ function App() {
   }, [transactions])
 
   const largestCategoryTotal = Math.max(...categoryTotals.map((item) => item.amount), 0)
+  const visibleTransactions = transactionFilter === 'all'
+    ? transactions
+    : transactions.filter((transaction) => transaction.transaction_type === transactionFilter)
   const isLoading = status === 'loading'
 
   return (
@@ -344,12 +375,29 @@ function App() {
                   <p className="panel-kicker">Історія</p>
                   <h2>Останні операції</h2>
                 </div>
-                <span className="transaction-count">{transactions.length}</span>
+                <span className="transaction-count">{visibleTransactions.length}</span>
+              </div>
+
+              <div className="transaction-filters" role="group" aria-label="Фільтр операцій">
+                {[
+                  ['all', 'Усі'],
+                  ['income', 'Доходи'],
+                  ['expense', 'Витрати'],
+                ].map(([filter, label]) => (
+                  <button
+                    className={transactionFilter === filter ? 'filter-button filter-button-active' : 'filter-button'}
+                    key={filter}
+                    type="button"
+                    onClick={() => setTransactionFilter(filter)}
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
 
               {isLoading ? (
                 <div className="list-placeholder">Завантажуємо операції…</div>
-              ) : transactions.length > 0 ? (
+              ) : visibleTransactions.length > 0 ? (
                 <div className="transaction-table-wrapper">
                   <table className="transaction-table">
                     <caption>Останні фінансові операції</caption>
@@ -365,7 +413,7 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {transactions.slice(0, 8).map((transaction) => {
+                      {visibleTransactions.slice(0, 8).map((transaction) => {
                         const isIncome = transaction.transaction_type === 'income'
 
                         return (
@@ -399,7 +447,7 @@ function App() {
                   </table>
                 </div>
               ) : (
-                <div className="empty-state">Операцій поки немає.</div>
+                <div className="empty-state">За цим фільтром операцій поки немає.</div>
               )}
               {transactionActionError && <p className="transaction-form-error" role="alert">{transactionActionError}</p>}
             </article>

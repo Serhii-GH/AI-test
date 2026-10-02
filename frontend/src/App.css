@@ -386,6 +386,27 @@ h2 {
   font-weight: 800;
 }
 
+.transaction-filters {
+  display: flex;
+  gap: 8px;
+  margin: 17px 0 4px;
+}
+
+.filter-button {
+  border: 1px solid rgba(226, 212, 180, 0.24);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #c8bda7;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 800;
+  padding: 7px 12px;
+}
+
+.filter-button:hover { border-color: rgba(228, 177, 110, 0.7); color: #fffaf0; }
+.filter-button-active { border-color: #e4b16e; background: rgba(228, 177, 110, 0.16); color: #f3d6a5; }
+
 .transaction-table-wrapper {
   overflow-x: auto;
   margin: 3px -6px -6px;
