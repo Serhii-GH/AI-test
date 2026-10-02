@@ -19,6 +19,16 @@
 ```
 
 Після запуску endpoint доступний за адресою `http://localhost:8000/api/transactions`.
+
+## Перевірка Gemini API ключа
+
+Щоб перевірити ключ `GEMINI_API_KEY` із `.env`, виконай окремий скрипт. Він
+надсилає до Gemini API запит на список доступних моделей і не виводить ключ у
+термінал:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.check_gemini_api
+```
 Docker Compose також запускає API на порту `8000` разом із ботом.
 
 ## Web dashboard
