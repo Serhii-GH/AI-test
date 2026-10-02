@@ -170,6 +170,61 @@ h2 {
 .retry-button:hover { background: #a94731; }
 .refresh-button:disabled { cursor: wait; opacity: 0.55; }
 
+.transaction-form-panel { margin-bottom: 17px; }
+
+.transaction-form {
+  display: grid;
+  grid-template-columns: 0.8fr 0.8fr 1fr 1.45fr 0.9fr auto;
+  align-items: end;
+  gap: 12px;
+  padding-top: 20px;
+}
+
+.transaction-form label {
+  display: grid;
+  gap: 7px;
+  color: #c8bda7;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.transaction-form input,
+.transaction-form select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid rgba(243, 235, 218, 0.28);
+  border-radius: 8px;
+  outline: none;
+  background: rgba(7, 11, 8, 0.48);
+  color: #fffdf5;
+  font: inherit;
+  letter-spacing: normal;
+  text-transform: none;
+  padding: 10px;
+}
+
+.transaction-form input:focus,
+.transaction-form select:focus { border-color: #e4b16e; }
+
+.submit-transaction-button {
+  min-height: 39px;
+  border: 0;
+  border-radius: 8px;
+  background: #719273;
+  color: #fffaf3;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 800;
+  padding: 0 15px;
+}
+
+.submit-transaction-button:hover:not(:disabled) { background: #5f8261; }
+.submit-transaction-button:disabled { cursor: wait; opacity: 0.62; }
+.transaction-form-error { margin: 15px 0 0; color: #f0a793; }
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -366,6 +421,15 @@ h2 {
   white-space: nowrap;
 }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
 .transaction-table td {
   max-width: 230px;
   padding: 14px;
@@ -397,6 +461,22 @@ h2 {
 .amount-heading, .table-amount { text-align: right !important; }
 .table-amount { color: #f09a83; font-weight: 800; white-space: nowrap; }
 .income-amount { color: #b5d3b5; }
+.transaction-action-cell { text-align: right; }
+
+.delete-transaction-button {
+  border: 1px solid rgba(240, 154, 131, 0.46);
+  border-radius: 7px;
+  background: rgba(198, 91, 63, 0.14);
+  color: #f0a793;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 800;
+  padding: 7px 10px;
+}
+
+.delete-transaction-button:hover:not(:disabled) { background: rgba(198, 91, 63, 0.3); }
+.delete-transaction-button:disabled { cursor: wait; opacity: 0.62; }
 
 .empty-state,
 .chart-placeholder,
@@ -428,6 +508,8 @@ h2 {
   .telegram-form { width: 100%; grid-template-columns: 1fr auto; }
   .telegram-form input { width: 100%; }
   .summary-grid, .content-grid { grid-template-columns: 1fr; }
+  .transaction-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .submit-transaction-button { min-height: 43px; }
   .summary-card { min-height: 132px; }
 }
 
@@ -435,6 +517,7 @@ h2 {
   .dashboard-shell { width: min(100% - 20px, 680px); padding-top: 10px; }
   .dashboard-header { padding: 25px 21px; border-radius: 20px; }
   .panel, .summary-card, .message-card { padding: 21px; }
+  .transaction-form { grid-template-columns: 1fr; }
   .bar-chart { gap: 7px; }
   .bar-column { grid-template-rows: auto 154px auto; }
   .bar-track { height: 154px; }

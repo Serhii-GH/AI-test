@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -25,6 +26,8 @@ from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 metadata = MetaData()
+
+WEB_TRANSACTIONS_CATEGORY = "Веб-операції"
 
 users = Table(
     "users",
@@ -237,7 +240,8 @@ async def save_transaction(
     subcategory_name: str,
     description: str,
     transaction_type: str,
-) -> None:
+    created_at: datetime | None = None,
+) -> dict[str, object]:
     """Create an income or expense in a two-level category hierarchy."""
     async with engine.begin() as connection:
         user_id = await connection.scalar(
@@ -245,7 +249,12 @@ async def save_transaction(
             .values(telegram_id=telegram_id, username=username)
             .on_conflict_do_update(
                 index_elements=[users.c.telegram_id],
-                set_={"username": username},
+                set_={
+                    "username": func.coalesce(
+                        insert(users).excluded.username,
+                        users.c.username,
+                    )
+                },
             )
             .returning(users.c.id)
         )
@@ -279,15 +288,33 @@ async def save_transaction(
             .returning(categories.c.id)
         )
 
-        await connection.execute(
-            insert(transactions).values(
-                user_id=user_id,
-                category_id=subcategory_id,
-                amount=amount,
-                transaction_type=transaction_type,
-                description=description,
+        transaction_values: dict[str, object] = {
+            "user_id": user_id,
+            "category_id": subcategory_id,
+            "amount": amount,
+            "transaction_type": transaction_type,
+            "description": description,
+        }
+        if created_at is not None:
+            transaction_values["created_at"] = created_at
+
+        result = await connection.execute(
+            insert(transactions)
+            .values(**transaction_values)
+            .returning(
+                transactions.c.id,
+                transactions.c.user_id,
+                transactions.c.category_id,
+                transactions.c.transaction_type,
+                transactions.c.amount,
+                transactions.c.description,
+                transactions.c.created_at,
             )
         )
+        transaction = dict(result.mappings().one())
+        transaction["main_category"] = main_category_name
+        transaction["subcategory"] = subcategory_name
+        return transaction
 
 
 async def get_transactions(engine: AsyncEngine, telegram_id: int) -> list[dict[str, object]]:

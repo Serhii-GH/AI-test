@@ -15,6 +15,22 @@ const dateFormatter = new Intl.DateTimeFormat('uk-UA', {
 
 const barColors = ['#c65b3f', '#d5864c', '#8d9a70', '#556b63', '#b6a176', '#7d6656']
 
+function getTodayForInput() {
+  const now = new Date()
+  const timezoneOffset = now.getTimezoneOffset() * 60_000
+  return new Date(now.getTime() - timezoneOffset).toISOString().slice(0, 10)
+}
+
+function createEmptyTransactionForm() {
+  return {
+    type: 'expense',
+    amount: '',
+    category: '',
+    description: '',
+    date: getTodayForInput(),
+  }
+}
+
 function formatCurrency(value) {
   return currencyFormatter.format(Number(value ?? 0))
 }
@@ -30,6 +46,11 @@ function App() {
   const [transactions, setTransactions] = useState([])
   const [status, setStatus] = useState(() => (localStorage.getItem('telegram_id') ? 'loading' : 'idle'))
   const [error, setError] = useState('')
+  const [transactionForm, setTransactionForm] = useState(createEmptyTransactionForm)
+  const [transactionError, setTransactionError] = useState('')
+  const [isSubmittingTransaction, setIsSubmittingTransaction] = useState(false)
+  const [transactionActionError, setTransactionActionError] = useState('')
+  const [deletingTransactionId, setDeletingTransactionId] = useState(null)
 
   const loadDashboard = useCallback(async (showLoading = true) => {
     if (!telegramId) {
@@ -87,6 +108,80 @@ function App() {
     setTelegramId(normalizedTelegramId)
     setError('')
     setStatus('loading')
+  }
+
+  function updateTransactionForm(event) {
+    const { name, value } = event.target
+    setTransactionForm((currentForm) => ({ ...currentForm, [name]: value }))
+  }
+
+  async function submitTransaction(event) {
+    event.preventDefault()
+    if (!telegramId) {
+      setTransactionError('Спочатку підключіть Telegram ID, щоб зберігати операції у своєму обліку.')
+      return
+    }
+
+    setIsSubmittingTransaction(true)
+    setTransactionError('')
+
+    try {
+      const response = await fetch('/api/transactions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          telegram_id: Number(telegramId),
+          ...transactionForm,
+        }),
+      })
+
+      if (!response.ok) {
+        const responseBody = await response.json().catch(() => null)
+        const detail = responseBody?.detail
+        const message = typeof detail === 'string'
+          ? detail
+          : 'Не вдалося зберегти операцію. Перевірте заповнені поля та спробуйте ще раз.'
+        throw new Error(message)
+      }
+
+      setTransactionForm(createEmptyTransactionForm())
+      await loadDashboard()
+    } catch (requestError) {
+      setTransactionError(requestError.message || 'Не вдалося зберегти операцію. Спробуйте ще раз.')
+    } finally {
+      setIsSubmittingTransaction(false)
+    }
+  }
+
+  async function deleteTransaction(transactionId) {
+    if (!telegramId || !window.confirm('Видалити операцію?')) {
+      return
+    }
+
+    setDeletingTransactionId(transactionId)
+    setTransactionActionError('')
+
+    try {
+      const response = await fetch(
+        `/api/transactions/${transactionId}?telegram_id=${encodeURIComponent(telegramId)}`,
+        { method: 'DELETE' },
+      )
+
+      if (!response.ok) {
+        const responseBody = await response.json().catch(() => null)
+        throw new Error(
+          typeof responseBody?.detail === 'string'
+            ? responseBody.detail
+            : 'Не вдалося видалити операцію. Спробуйте ще раз.',
+        )
+      }
+
+      await loadDashboard()
+    } catch (requestError) {
+      setTransactionActionError(requestError.message || 'Не вдалося видалити операцію. Спробуйте ще раз.')
+    } finally {
+      setDeletingTransactionId(null)
+    }
   }
 
   const categoryTotals = useMemo(() => {
@@ -170,6 +265,44 @@ function App() {
             </article>
       </section>
 
+      <section className="panel transaction-form-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="panel-kicker">Нова операція</p>
+            <h2>Додайте до бюджету</h2>
+          </div>
+        </div>
+        <form className="transaction-form" onSubmit={submitTransaction}>
+          <label>
+            Тип
+            <select name="type" value={transactionForm.type} onChange={updateTransactionForm}>
+              <option value="expense">Витрата</option>
+              <option value="income">Дохід</option>
+            </select>
+          </label>
+          <label>
+            Сума, грн
+            <input name="amount" type="number" min="0.01" step="0.01" value={transactionForm.amount} onChange={updateTransactionForm} required />
+          </label>
+          <label>
+            Категорія
+            <input name="category" maxLength="100" value={transactionForm.category} onChange={updateTransactionForm} placeholder="Наприклад, Електрика" required />
+          </label>
+          <label>
+            Опис
+            <input name="description" maxLength="255" value={transactionForm.description} onChange={updateTransactionForm} placeholder="Наприклад, Кабель" required />
+          </label>
+          <label>
+            Дата
+            <input name="date" type="date" value={transactionForm.date} onChange={updateTransactionForm} required />
+          </label>
+          <button className="submit-transaction-button" type="submit" disabled={isSubmittingTransaction}>
+            {isSubmittingTransaction ? 'Зберігаємо…' : 'Додати операцію'}
+          </button>
+        </form>
+        {transactionError && <p className="transaction-form-error" role="alert">{transactionError}</p>}
+      </section>
+
       <section className="content-grid">
             <article className="panel chart-panel">
               <div className="panel-heading">
@@ -228,6 +361,7 @@ function App() {
                         <th scope="col">Підкатегорія</th>
                         <th scope="col">Позиція</th>
                         <th scope="col" className="amount-heading">Сума</th>
+                        <th scope="col"><span className="visually-hidden">Дія</span></th>
                       </tr>
                     </thead>
                     <tbody>
@@ -248,6 +382,16 @@ function App() {
                             <td className={isIncome ? 'table-amount income-amount' : 'table-amount'}>
                               {isIncome ? '+' : '−'}{formatCurrency(transaction.amount)}
                             </td>
+                            <td className="transaction-action-cell">
+                              <button
+                                className="delete-transaction-button"
+                                type="button"
+                                onClick={() => deleteTransaction(transaction.id)}
+                                disabled={deletingTransactionId === transaction.id}
+                              >
+                                {deletingTransactionId === transaction.id ? 'Видаляємо…' : 'Видалити'}
+                              </button>
+                            </td>
                           </tr>
                         )
                       })}
@@ -257,6 +401,7 @@ function App() {
               ) : (
                 <div className="empty-state">Операцій поки немає.</div>
               )}
+              {transactionActionError && <p className="transaction-form-error" role="alert">{transactionActionError}</p>}
             </article>
       </section>
     </main>
