@@ -7,6 +7,12 @@ const currencyFormatter = new Intl.NumberFormat('uk-UA', {
   maximumFractionDigits: 2,
 })
 
+const usdFormatter = new Intl.NumberFormat('uk-UA', {
+  style: 'currency',
+  currency: 'USD',
+  maximumFractionDigits: 2,
+})
+
 const dateFormatter = new Intl.DateTimeFormat('uk-UA', {
   day: '2-digit',
   month: 'short',
@@ -14,6 +20,7 @@ const dateFormatter = new Intl.DateTimeFormat('uk-UA', {
 })
 
 const barColors = ['#c65b3f', '#d5864c', '#8d9a70', '#556b63', '#b6a176', '#7d6656']
+const TRANSACTION_PAGE_SIZE = 10
 
 function getTodayForInput() {
   const now = new Date()
@@ -25,7 +32,9 @@ function createEmptyTransactionForm() {
   return {
     type: 'expense',
     amount: '',
-    category: '',
+    exchange_rate: '',
+    category: 'Роботи',
+    subcategory: '',
     description: '',
     date: getTodayForInput(),
   }
@@ -35,18 +44,29 @@ function formatCurrency(value) {
   return currencyFormatter.format(Number(value ?? 0))
 }
 
+function formatUsd(value) {
+  return usdFormatter.format(Number(value ?? 0))
+}
+
 function formatDate(value) {
   return value ? dateFormatter.format(new Date(value)) : '—'
 }
 
 function App() {
   const [telegramId, setTelegramId] = useState(null)
+  const [telegramUsername, setTelegramUsername] = useState(null)
+  const [telegramAvatarUrl, setTelegramAvatarUrl] = useState(null)
   const [telegramIdInput, setTelegramIdInput] = useState('')
   const [loginCode, setLoginCode] = useState('')
   const [authStatus, setAuthStatus] = useState('checking')
   const [authError, setAuthError] = useState('')
   const [summary, setSummary] = useState(null)
   const [transactions, setTransactions] = useState([])
+  const [projects, setProjects] = useState([])
+  const [activeProjectId, setActiveProjectId] = useState(null)
+  const [newProjectName, setNewProjectName] = useState('')
+  const [projectError, setProjectError] = useState('')
+  const [isCreatingProject, setIsCreatingProject] = useState(false)
   const [status, setStatus] = useState('idle')
   const [error, setError] = useState('')
   const [transactionForm, setTransactionForm] = useState(createEmptyTransactionForm)
@@ -55,9 +75,34 @@ function App() {
   const [transactionActionError, setTransactionActionError] = useState('')
   const [deletingTransactionId, setDeletingTransactionId] = useState(null)
   const [transactionFilter, setTransactionFilter] = useState('all')
+  const [visibleTransactionLimit, setVisibleTransactionLimit] = useState(TRANSACTION_PAGE_SIZE)
+  const [analysis, setAnalysis] = useState(null)
+  const [analysisStatus, setAnalysisStatus] = useState('idle')
+  const [analysisError, setAnalysisError] = useState('')
+
+  const loadProjects = useCallback(async () => {
+    if (!telegramId) {
+      return
+    }
+    try {
+      const response = await fetch('/api/projects')
+      if (!response.ok) {
+        throw new Error('Не вдалося завантажити проєкти.')
+      }
+      const projectData = await response.json()
+      setProjects(projectData)
+      setActiveProjectId((currentProjectId) => (
+        projectData.some((project) => project.id === currentProjectId)
+          ? currentProjectId
+          : projectData[0]?.id ?? null
+      ))
+    } catch (requestError) {
+      setProjectError(requestError.message)
+    }
+  }, [telegramId])
 
   const loadDashboard = useCallback(async (showLoading = true) => {
-    if (!telegramId) {
+    if (!telegramId || !activeProjectId) {
       return
     }
 
@@ -68,8 +113,8 @@ function App() {
 
     try {
       const [summaryResponse, transactionsResponse] = await Promise.all([
-        fetch('/api/summary'),
-        fetch('/api/transactions'),
+        fetch(`/api/summary?project_id=${activeProjectId}`),
+        fetch(`/api/transactions?project_id=${activeProjectId}`),
       ])
 
       if (!summaryResponse.ok || !transactionsResponse.ok) {
@@ -88,7 +133,7 @@ function App() {
       setStatus('error')
       setError(requestError.message)
     }
-  }, [telegramId])
+  }, [activeProjectId, telegramId])
 
   useEffect(() => {
     let isCurrent = true
@@ -102,6 +147,7 @@ function App() {
         const session = await response.json()
         if (isCurrent) {
           setTelegramId(String(session.telegram_id))
+          setTelegramUsername(session.username ?? null)
           setAuthStatus('authenticated')
         }
       } catch {
@@ -116,13 +162,57 @@ function App() {
   }, [])
 
   useEffect(() => {
+    let avatarUrl = null
+    let isCurrent = true
+
+    async function loadTelegramAvatar() {
+      if (!telegramId) {
+        setTelegramAvatarUrl(null)
+        return
+      }
+
+      try {
+        const response = await fetch('/api/auth/avatar')
+        if (response.status !== 200 || !response.headers.get('content-type')?.startsWith('image/')) {
+          return
+        }
+        avatarUrl = URL.createObjectURL(await response.blob())
+        if (isCurrent) {
+          setTelegramAvatarUrl(avatarUrl)
+        }
+      } catch {
+        if (isCurrent) {
+          setTelegramAvatarUrl(null)
+        }
+      }
+    }
+
+    void loadTelegramAvatar()
+    return () => {
+      isCurrent = false
+      if (avatarUrl) {
+        URL.revokeObjectURL(avatarUrl)
+      }
+    }
+  }, [telegramId])
+
+  useEffect(() => {
     if (!telegramId) {
       return undefined
     }
 
-    const loadTimer = window.setTimeout(() => loadDashboard(false), 0)
+    const loadTimer = window.setTimeout(() => { void loadProjects() }, 0)
     return () => window.clearTimeout(loadTimer)
-  }, [loadDashboard, telegramId])
+  }, [loadProjects, telegramId])
+
+  useEffect(() => {
+    if (!telegramId || !activeProjectId) {
+      return undefined
+    }
+
+    const loadTimer = window.setTimeout(() => { void loadDashboard(false) }, 0)
+    return () => window.clearTimeout(loadTimer)
+  }, [activeProjectId, loadDashboard, telegramId])
 
   async function verifyLogin(event) {
     event.preventDefault()
@@ -152,6 +242,7 @@ function App() {
 
       const session = await response.json()
       setTelegramId(String(session.telegram_id))
+      setTelegramUsername(session.username ?? null)
       setLoginCode('')
       setAuthStatus('authenticated')
     } catch (requestError) {
@@ -163,8 +254,14 @@ function App() {
   async function logout() {
     await fetch('/api/auth/logout', { method: 'POST' })
     setTelegramId(null)
+    setTelegramUsername(null)
+    setTelegramAvatarUrl(null)
     setSummary(null)
     setTransactions([])
+    setProjects([])
+    setActiveProjectId(null)
+    setAnalysis(null)
+    setAnalysisStatus('idle')
     setStatus('idle')
     setAuthStatus('unauthenticated')
   }
@@ -172,6 +269,40 @@ function App() {
   function updateTransactionForm(event) {
     const { name, value } = event.target
     setTransactionForm((currentForm) => ({ ...currentForm, [name]: value }))
+  }
+
+  async function createProject(event) {
+    event.preventDefault()
+    const name = newProjectName.trim()
+    if (!name) {
+      setProjectError('Вкажіть назву нового фінансового огляду.')
+      return
+    }
+
+    setIsCreatingProject(true)
+    setProjectError('')
+    try {
+      const response = await fetch('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      if (!response.ok) {
+        const responseBody = await response.json().catch(() => null)
+        throw new Error(typeof responseBody?.detail === 'string' ? responseBody.detail : 'Не вдалося створити проєкт.')
+      }
+      const project = await response.json()
+      setProjects((currentProjects) => [...currentProjects, project])
+      setNewProjectName('')
+      setActiveProjectId(project.id)
+      setAnalysis(null)
+      setAnalysisStatus('idle')
+      setVisibleTransactionLimit(TRANSACTION_PAGE_SIZE)
+    } catch (requestError) {
+      setProjectError(requestError.message || 'Не вдалося створити проєкт. Спробуйте ще раз.')
+    } finally {
+      setIsCreatingProject(false)
+    }
   }
 
   async function submitTransaction(event) {
@@ -182,8 +313,11 @@ function App() {
     }
 
     const amount = transactionForm.amount.trim()
+    const exchangeRate = transactionForm.exchange_rate.trim()
     const category = transactionForm.category.trim()
+    const subcategory = transactionForm.subcategory.trim()
     const parsedAmount = Number(amount)
+    const parsedExchangeRate = Number(exchangeRate)
 
     if (!amount) {
       setTransactionError('Вкажіть суму операції.')
@@ -201,8 +335,16 @@ function App() {
       setTransactionError('Оберіть коректний тип операції.')
       return
     }
-    if (!category) {
-      setTransactionError('Вкажіть категорію операції.')
+    if (!['Роботи', 'Матеріали'].includes(category)) {
+      setTransactionError('Оберіть категорію «Роботи» або «Матеріали».')
+      return
+    }
+    if (!exchangeRate || !Number.isFinite(parsedExchangeRate) || parsedExchangeRate <= 0) {
+      setTransactionError('Вкажіть додатний курс USD у гривнях на дату операції.')
+      return
+    }
+    if (!subcategory) {
+      setTransactionError('Вкажіть підкатегорію операції.')
       return
     }
 
@@ -215,8 +357,11 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...transactionForm,
+          project_id: activeProjectId,
           amount,
+          exchange_rate: exchangeRate,
           category,
+          subcategory,
         }),
       })
 
@@ -230,6 +375,7 @@ function App() {
       }
 
       setTransactionForm(createEmptyTransactionForm())
+      setAnalysis(null)
       await loadDashboard()
     } catch (requestError) {
       setTransactionError(requestError.message || 'Не вдалося зберегти операцію. Спробуйте ще раз.')
@@ -239,7 +385,7 @@ function App() {
   }
 
   async function deleteTransaction(transactionId) {
-    if (!telegramId || !window.confirm('Видалити операцію?')) {
+    if (!telegramId || !activeProjectId || !window.confirm('Видалити операцію?')) {
       return
     }
 
@@ -247,7 +393,7 @@ function App() {
     setTransactionActionError('')
 
     try {
-      const response = await fetch(`/api/transactions/${transactionId}`, { method: 'DELETE' })
+      const response = await fetch(`/api/transactions/${transactionId}?project_id=${activeProjectId}`, { method: 'DELETE' })
 
       if (!response.ok) {
         const responseBody = await response.json().catch(() => null)
@@ -259,10 +405,36 @@ function App() {
       }
 
       await loadDashboard()
+      setAnalysis(null)
     } catch (requestError) {
       setTransactionActionError(requestError.message || 'Не вдалося видалити операцію. Спробуйте ще раз.')
     } finally {
       setDeletingTransactionId(null)
+    }
+  }
+
+  async function runAiAnalysis() {
+    if (!telegramId || !activeProjectId) {
+      return
+    }
+
+    setAnalysisStatus('loading')
+    setAnalysisError('')
+    try {
+      const response = await fetch(`/api/ai/analyze-transactions?project_id=${activeProjectId}`, { method: 'POST' })
+      if (!response.ok) {
+        const responseBody = await response.json().catch(() => null)
+        throw new Error(
+          typeof responseBody?.detail === 'string'
+            ? responseBody.detail
+            : 'Не вдалося виконати AI-аналіз. Спробуйте ще раз.',
+        )
+      }
+      setAnalysis(await response.json())
+      setAnalysisStatus('ready')
+    } catch (requestError) {
+      setAnalysisError(requestError.message || 'Не вдалося виконати AI-аналіз. Спробуйте ще раз.')
+      setAnalysisStatus('error')
     }
   }
 
@@ -288,6 +460,8 @@ function App() {
   const visibleTransactions = transactionFilter === 'all'
     ? transactions
     : transactions.filter((transaction) => transaction.transaction_type === transactionFilter)
+  const displayedTransactions = visibleTransactions.slice(0, visibleTransactionLimit)
+  const hasMoreTransactions = displayedTransactions.length < visibleTransactions.length
   const isLoading = status === 'loading'
 
   return (
@@ -301,8 +475,16 @@ function App() {
         <div className="header-actions">
           {authStatus === 'authenticated' ? (
             <>
-              <span className="authenticated-user">Telegram ID: {telegramId}</span>
-              <button className="refresh-button" type="button" onClick={() => loadDashboard()} disabled={isLoading}>
+              <div className="authenticated-user">
+                <span className="user-avatar" aria-hidden="true">
+                  {telegramAvatarUrl ? <img src={telegramAvatarUrl} alt="" /> : '👤'}
+                </span>
+                <span>
+                  <strong>{telegramUsername ? `@${telegramUsername}` : 'Користувач Telegram'}</strong>
+                  <small>Telegram ID: {telegramId}</small>
+                </span>
+              </div>
+              <button className="refresh-button" type="button" onClick={() => loadDashboard()} disabled={isLoading || !activeProjectId}>
                 {isLoading ? 'Оновлюємо…' : '↻ Оновити дані'}
               </button>
               <button className="logout-button" type="button" onClick={logout}>Вийти</button>
@@ -335,6 +517,48 @@ function App() {
           )}
         </div>
       </header>
+
+      {authStatus === 'authenticated' && (
+        <section className="panel project-switcher">
+          <div>
+            <p className="panel-kicker">Фінансові огляди</p>
+            <div className="project-tabs" role="tablist" aria-label="Фінансові проєкти">
+              {projects.map((project) => (
+                <button
+                  className={project.id === activeProjectId ? 'project-tab project-tab-active' : 'project-tab'}
+                  key={project.id}
+                  role="tab"
+                  aria-selected={project.id === activeProjectId}
+                  type="button"
+                  onClick={() => {
+                    setActiveProjectId(project.id)
+                    setAnalysis(null)
+                    setAnalysisStatus('idle')
+                    setVisibleTransactionLimit(TRANSACTION_PAGE_SIZE)
+                  }}
+                >
+                  {project.name}
+                </button>
+              ))}
+            </div>
+          </div>
+          <form className="new-project-form" onSubmit={createProject}>
+            <label htmlFor="new-project-name">Новий огляд</label>
+            <input
+              id="new-project-name"
+              maxLength="150"
+              value={newProjectName}
+              onChange={(event) => setNewProjectName(event.target.value)}
+              placeholder="Наприклад, Будинок у Львові"
+              disabled={isCreatingProject}
+            />
+            <button type="submit" disabled={isCreatingProject}>
+              {isCreatingProject ? 'Створюємо…' : '+ Створити'}
+            </button>
+          </form>
+          {projectError && <p className="transaction-form-error" role="alert">{projectError}</p>}
+        </section>
+      )}
 
       {authStatus === 'unauthenticated' && (
         <section className="message-card bind-card">
@@ -371,6 +595,56 @@ function App() {
             </article>
       </section>
 
+      <section className="panel ai-analysis-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="panel-kicker">Gemini AI</p>
+            <h2>Аналіз фінансових операцій</h2>
+          </div>
+          <button
+            className="ai-analysis-button"
+            type="button"
+            onClick={runAiAnalysis}
+            disabled={!telegramId || !activeProjectId || analysisStatus === 'loading'}
+          >
+            {analysisStatus === 'loading' ? 'Аналізуємо…' : 'Запустити AI-аналіз'}
+          </button>
+        </div>
+
+        {analysisStatus === 'loading' && <p className="ai-analysis-loading">Gemini аналізує ваші операції…</p>}
+        {analysisStatus === 'error' && <p className="transaction-form-error" role="alert">{analysisError}</p>}
+
+        {analysis && analysisStatus === 'ready' && (
+          <div className="ai-analysis-results">
+            <article>
+              <h3>Загальний висновок</h3>
+              <p>{analysis.summary}</p>
+            </article>
+            <article>
+              <h3>Основні категорії витрат</h3>
+              {analysis.expense_categories.length > 0 ? (
+                <ul className="ai-analysis-list category-analysis-list">
+                  {analysis.expense_categories.map((category) => (
+                    <li key={category.category}>
+                      <span>{category.category}</span>
+                      <strong>{formatCurrency(category.amount)}</strong>
+                    </li>
+                  ))}
+                </ul>
+              ) : <p>Витрат для аналізу поки немає.</p>}
+            </article>
+            <article>
+              <h3>Можливі ризики</h3>
+              {analysis.risks.length > 0 ? <ul className="ai-analysis-list">{analysis.risks.map((risk) => <li key={risk}>{risk}</li>)}</ul> : <p>Явних ризиків не виявлено.</p>}
+            </article>
+            <article>
+              <h3>Практичні поради</h3>
+              {analysis.recommendations.length > 0 ? <ul className="ai-analysis-list">{analysis.recommendations.map((recommendation) => <li key={recommendation}>{recommendation}</li>)}</ul> : <p>Поради з’являться після додавання операцій.</p>}
+            </article>
+          </div>
+        )}
+      </section>
+
       <section className="panel transaction-form-panel">
         <div className="panel-heading">
           <div>
@@ -391,12 +665,23 @@ function App() {
             <input name="amount" type="number" min="0.01" step="0.01" value={transactionForm.amount} onChange={updateTransactionForm} required />
           </label>
           <label>
-            Категорія
-            <input name="category" maxLength="100" value={transactionForm.category} onChange={updateTransactionForm} placeholder="Наприклад, Електрика" required />
+            Курс USD, грн
+            <input name="exchange_rate" type="number" min="0.0001" step="0.0001" value={transactionForm.exchange_rate} onChange={updateTransactionForm} placeholder="Наприклад, 41.50" required />
           </label>
           <label>
-            Опис
-            <input name="description" maxLength="255" value={transactionForm.description} onChange={updateTransactionForm} placeholder="Наприклад, Кабель" required />
+            Категорія
+            <select name="category" value={transactionForm.category} onChange={updateTransactionForm}>
+              <option value="Роботи">Роботи</option>
+              <option value="Матеріали">Матеріали</option>
+            </select>
+          </label>
+          <label>
+            Підкатегорія
+            <input name="subcategory" maxLength="100" value={transactionForm.subcategory} onChange={updateTransactionForm} placeholder="Наприклад, Сантехніка, електрика, стіни або меблі" required />
+          </label>
+          <label>
+            Позиція
+            <input name="description" maxLength="255" value={transactionForm.description} onChange={updateTransactionForm} placeholder="Наприклад, Кабель ВВГнг 3×2,5 або монтаж розеток" required />
           </label>
           <label>
             Дата
@@ -463,7 +748,10 @@ function App() {
                     className={transactionFilter === filter ? 'filter-button filter-button-active' : 'filter-button'}
                     key={filter}
                     type="button"
-                    onClick={() => setTransactionFilter(filter)}
+                    onClick={() => {
+                      setTransactionFilter(filter)
+                      setVisibleTransactionLimit(TRANSACTION_PAGE_SIZE)
+                    }}
                   >
                     {label}
                   </button>
@@ -473,7 +761,8 @@ function App() {
               {isLoading ? (
                 <div className="list-placeholder">Завантажуємо операції…</div>
               ) : visibleTransactions.length > 0 ? (
-                <div className="transaction-table-wrapper">
+                <>
+                  <div className="transaction-table-wrapper">
                   <table className="transaction-table">
                     <caption>Останні фінансові операції</caption>
                     <thead>
@@ -483,12 +772,13 @@ function App() {
                         <th scope="col">Категорія</th>
                         <th scope="col">Підкатегорія</th>
                         <th scope="col">Позиція</th>
-                        <th scope="col" className="amount-heading">Сума</th>
+                        <th scope="col" className="amount-heading">Сума, грн</th>
+                        <th scope="col" className="amount-heading">Сума, $</th>
                         <th scope="col"><span className="visually-hidden">Дія</span></th>
                       </tr>
                     </thead>
                     <tbody>
-                      {visibleTransactions.slice(0, 8).map((transaction) => {
+                      {displayedTransactions.map((transaction) => {
                         const isIncome = transaction.transaction_type === 'income'
 
                         return (
@@ -505,6 +795,12 @@ function App() {
                             <td className={isIncome ? 'table-amount income-amount' : 'table-amount'}>
                               {isIncome ? '+' : '−'}{formatCurrency(transaction.amount)}
                             </td>
+                            <td className={isIncome ? 'table-amount usd-amount income-amount' : 'table-amount usd-amount'}>
+                              {transaction.amount_usd == null ? '—' : <>
+                                {isIncome ? '+' : '−'}{formatUsd(transaction.amount_usd)}
+                                <small>Курс: {Number(transaction.exchange_rate).toFixed(4)} грн/$</small>
+                              </>}
+                            </td>
                             <td className="transaction-action-cell">
                               <button
                                 className="delete-transaction-button"
@@ -520,7 +816,29 @@ function App() {
                       })}
                     </tbody>
                   </table>
-                </div>
+                  </div>
+                  {hasMoreTransactions && (
+                    <div className="transaction-pagination">
+                      <p>Показано {displayedTransactions.length} з {visibleTransactions.length} операцій</p>
+                      <div>
+                        <button
+                          className="show-more-button"
+                          type="button"
+                          onClick={() => setVisibleTransactionLimit((limit) => limit + TRANSACTION_PAGE_SIZE)}
+                        >
+                          Показати ще
+                        </button>
+                        <button
+                          className="show-all-button"
+                          type="button"
+                          onClick={() => setVisibleTransactionLimit(visibleTransactions.length)}
+                        >
+                          Показати всі
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
               ) : (
                 <div className="empty-state">За цим фільтром операцій поки немає.</div>
               )}

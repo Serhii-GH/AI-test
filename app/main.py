@@ -52,7 +52,8 @@ COMMANDS_DESCRIPTION = (
 )
 
 MAIN_CATEGORIES = {
-    "робота": "Робота",
+    "робота": "Роботи",
+    "роботи": "Роботи",
     "матеріали": "Матеріали",
 }
 
@@ -65,6 +66,7 @@ TRANSACTION_TYPES = {
 class TransactionForm(StatesGroup):
     transaction_type = State()
     amount = State()
+    exchange_rate = State()
     main_category = State()
     subcategory = State()
     description = State()
@@ -84,7 +86,7 @@ def transaction_type_keyboard() -> ReplyKeyboardMarkup:
 
 def main_category_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Робота"), KeyboardButton(text="Матеріали")]],
+        keyboard=[[KeyboardButton(text="Роботи"), KeyboardButton(text="Матеріали")]],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -103,11 +105,18 @@ def transaction_type_label(transaction_type: str) -> str:
 
 
 def transaction_details(transaction: dict[str, object]) -> str:
+    usd_amount = transaction.get("amount_usd")
+    exchange_rate = transaction.get("exchange_rate")
+    usd_details = (
+        f"\n${Decimal(str(usd_amount)):.2f} (курс {Decimal(str(exchange_rate)):.4f} грн/USD)"
+        if usd_amount is not None and exchange_rate is not None
+        else ""
+    )
     return (
         f"#{transaction['id']} — {transaction_type_label(str(transaction['transaction_type']))}\n"
         f"{transaction.get('main_category') or 'Категорія'} → {transaction['subcategory']} → "
         f"{transaction.get('description') or 'Без позиції'}\n"
-        f"{Decimal(str(transaction['amount'])):.2f} грн"
+        f"{Decimal(str(transaction['amount'])):.2f} грн{usd_details}"
     )
 
 
@@ -250,15 +259,32 @@ async def amount_handler(message: Message, state: FSMContext) -> None:
         return
 
     await state.update_data(amount=str(amount))
+    await state.set_state(TransactionForm.exchange_rate)
+    await message.answer("Вкажіть курс USD у гривнях на дату операції. Наприклад: 41.50")
+
+
+@dp.message(TransactionForm.exchange_rate)
+async def exchange_rate_handler(message: Message, state: FSMContext) -> None:
+    try:
+        exchange_rate = Decimal((message.text or "").replace(",", ".").strip())
+    except InvalidOperation:
+        await message.answer("Курс має бути числом. Наприклад: 41.50")
+        return
+
+    if not exchange_rate.is_finite() or exchange_rate <= 0 or exchange_rate.as_tuple().exponent < -4:
+        await message.answer("Вкажіть додатний курс не більш ніж з чотирма знаками після коми.")
+        return
+
+    await state.update_data(exchange_rate=str(exchange_rate))
     await state.set_state(TransactionForm.main_category)
-    await message.answer("Оберіть основну категорію: Робота чи Матеріали?", reply_markup=main_category_keyboard())
+    await message.answer("Оберіть основну категорію: Роботи чи Матеріали?", reply_markup=main_category_keyboard())
 
 
 @dp.message(TransactionForm.main_category)
 async def main_category_handler(message: Message, state: FSMContext) -> None:
     main_category_name = MAIN_CATEGORIES.get((message.text or "").strip().casefold())
     if main_category_name is None:
-        await message.answer("Оберіть «Робота» або «Матеріали» кнопкою нижче.", reply_markup=main_category_keyboard())
+        await message.answer("Оберіть «Роботи» або «Матеріали» кнопкою нижче.", reply_markup=main_category_keyboard())
         return
 
     await state.update_data(main_category_name=main_category_name)
@@ -292,12 +318,14 @@ async def description_handler(message: Message, state: FSMContext) -> None:
 
     data = await state.get_data()
     amount = Decimal(data["amount"])
+    exchange_rate = Decimal(data["exchange_rate"])
     try:
-        await save_transaction(
+        transaction = await save_transaction(
             engine=database_engine,
             telegram_id=message.from_user.id,
             username=message.from_user.username,
             amount=amount,
+            exchange_rate=exchange_rate,
             main_category_name=data["main_category_name"],
             subcategory_name=data["subcategory_name"],
             description=description,
@@ -310,7 +338,7 @@ async def description_handler(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.answer(
-        f"{data['transaction_type_label']} {amount:.2f} грн збережено:\n"
+        f"{data['transaction_type_label']} {amount:.2f} грн (${Decimal(str(transaction['amount_usd'])):.2f}, курс {exchange_rate:.4f}) збережено:\n"
         f"{data['main_category_name']} → {data['subcategory_name']} → {description}",
         reply_markup=ReplyKeyboardRemove(),
     )

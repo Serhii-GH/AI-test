@@ -19,6 +19,23 @@
 ```
 
 Після запуску endpoint доступний за адресою `http://localhost:8000/api/transactions`.
+
+## Перевірка Gemini API ключа
+
+Щоб перевірити ключ `GEMINI_API_KEY` із `.env`, виконай окремий скрипт. Він
+надсилає через офіційний Python SDK короткий запит до моделі `GEMINI_MODEL` і
+не виводить ключ у термінал:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.check_gemini_api
+```
+
+## AI-аналіз операцій
+
+Авторизований користувач може вручну запустити `POST /api/ai/analyze-transactions`.
+Backend бере лише операції цього користувача з Neon, передає їх Gemini та
+перевіряє структуровану відповідь перед поверненням у dashboard. Ключ
+`GEMINI_API_KEY` читається тільки на backend і ніколи не надсилається в React.
 Docker Compose також запускає API на порту `8000` разом із ботом.
 
 ## Web dashboard
