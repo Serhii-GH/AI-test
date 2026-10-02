@@ -52,7 +52,8 @@ COMMANDS_DESCRIPTION = (
 )
 
 MAIN_CATEGORIES = {
-    "робота": "Робота",
+    "робота": "Роботи",
+    "роботи": "Роботи",
     "матеріали": "Матеріали",
 }
 
@@ -84,7 +85,7 @@ def transaction_type_keyboard() -> ReplyKeyboardMarkup:
 
 def main_category_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Робота"), KeyboardButton(text="Матеріали")]],
+        keyboard=[[KeyboardButton(text="Роботи"), KeyboardButton(text="Матеріали")]],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -251,14 +252,14 @@ async def amount_handler(message: Message, state: FSMContext) -> None:
 
     await state.update_data(amount=str(amount))
     await state.set_state(TransactionForm.main_category)
-    await message.answer("Оберіть основну категорію: Робота чи Матеріали?", reply_markup=main_category_keyboard())
+    await message.answer("Оберіть основну категорію: Роботи чи Матеріали?", reply_markup=main_category_keyboard())
 
 
 @dp.message(TransactionForm.main_category)
 async def main_category_handler(message: Message, state: FSMContext) -> None:
     main_category_name = MAIN_CATEGORIES.get((message.text or "").strip().casefold())
     if main_category_name is None:
-        await message.answer("Оберіть «Робота» або «Матеріали» кнопкою нижче.", reply_markup=main_category_keyboard())
+        await message.answer("Оберіть «Роботи» або «Матеріали» кнопкою нижче.", reply_markup=main_category_keyboard())
         return
 
     await state.update_data(main_category_name=main_category_name)

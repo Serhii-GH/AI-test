@@ -25,7 +25,8 @@ function createEmptyTransactionForm() {
   return {
     type: 'expense',
     amount: '',
-    category: '',
+    category: 'Роботи',
+    subcategory: '',
     description: '',
     date: getTodayForInput(),
   }
@@ -55,6 +56,9 @@ function App() {
   const [transactionActionError, setTransactionActionError] = useState('')
   const [deletingTransactionId, setDeletingTransactionId] = useState(null)
   const [transactionFilter, setTransactionFilter] = useState('all')
+  const [analysis, setAnalysis] = useState(null)
+  const [analysisStatus, setAnalysisStatus] = useState('idle')
+  const [analysisError, setAnalysisError] = useState('')
 
   const loadDashboard = useCallback(async (showLoading = true) => {
     if (!telegramId) {
@@ -165,6 +169,8 @@ function App() {
     setTelegramId(null)
     setSummary(null)
     setTransactions([])
+    setAnalysis(null)
+    setAnalysisStatus('idle')
     setStatus('idle')
     setAuthStatus('unauthenticated')
   }
@@ -183,6 +189,7 @@ function App() {
 
     const amount = transactionForm.amount.trim()
     const category = transactionForm.category.trim()
+    const subcategory = transactionForm.subcategory.trim()
     const parsedAmount = Number(amount)
 
     if (!amount) {
@@ -201,8 +208,12 @@ function App() {
       setTransactionError('Оберіть коректний тип операції.')
       return
     }
-    if (!category) {
-      setTransactionError('Вкажіть категорію операції.')
+    if (!['Роботи', 'Матеріали'].includes(category)) {
+      setTransactionError('Оберіть категорію «Роботи» або «Матеріали».')
+      return
+    }
+    if (!subcategory) {
+      setTransactionError('Вкажіть підкатегорію операції.')
       return
     }
 
@@ -217,6 +228,7 @@ function App() {
           ...transactionForm,
           amount,
           category,
+          subcategory,
         }),
       })
 
@@ -230,6 +242,7 @@ function App() {
       }
 
       setTransactionForm(createEmptyTransactionForm())
+      setAnalysis(null)
       await loadDashboard()
     } catch (requestError) {
       setTransactionError(requestError.message || 'Не вдалося зберегти операцію. Спробуйте ще раз.')
@@ -259,10 +272,36 @@ function App() {
       }
 
       await loadDashboard()
+      setAnalysis(null)
     } catch (requestError) {
       setTransactionActionError(requestError.message || 'Не вдалося видалити операцію. Спробуйте ще раз.')
     } finally {
       setDeletingTransactionId(null)
+    }
+  }
+
+  async function runAiAnalysis() {
+    if (!telegramId) {
+      return
+    }
+
+    setAnalysisStatus('loading')
+    setAnalysisError('')
+    try {
+      const response = await fetch('/api/ai/analyze-transactions', { method: 'POST' })
+      if (!response.ok) {
+        const responseBody = await response.json().catch(() => null)
+        throw new Error(
+          typeof responseBody?.detail === 'string'
+            ? responseBody.detail
+            : 'Не вдалося виконати AI-аналіз. Спробуйте ще раз.',
+        )
+      }
+      setAnalysis(await response.json())
+      setAnalysisStatus('ready')
+    } catch (requestError) {
+      setAnalysisError(requestError.message || 'Не вдалося виконати AI-аналіз. Спробуйте ще раз.')
+      setAnalysisStatus('error')
     }
   }
 
@@ -371,6 +410,56 @@ function App() {
             </article>
       </section>
 
+      <section className="panel ai-analysis-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="panel-kicker">Gemini AI</p>
+            <h2>Аналіз фінансових операцій</h2>
+          </div>
+          <button
+            className="ai-analysis-button"
+            type="button"
+            onClick={runAiAnalysis}
+            disabled={!telegramId || analysisStatus === 'loading'}
+          >
+            {analysisStatus === 'loading' ? 'Аналізуємо…' : 'Запустити AI-аналіз'}
+          </button>
+        </div>
+
+        {analysisStatus === 'loading' && <p className="ai-analysis-loading">Gemini аналізує ваші операції…</p>}
+        {analysisStatus === 'error' && <p className="transaction-form-error" role="alert">{analysisError}</p>}
+
+        {analysis && analysisStatus === 'ready' && (
+          <div className="ai-analysis-results">
+            <article>
+              <h3>Загальний висновок</h3>
+              <p>{analysis.summary}</p>
+            </article>
+            <article>
+              <h3>Основні категорії витрат</h3>
+              {analysis.expense_categories.length > 0 ? (
+                <ul className="ai-analysis-list category-analysis-list">
+                  {analysis.expense_categories.map((category) => (
+                    <li key={category.category}>
+                      <span>{category.category}</span>
+                      <strong>{formatCurrency(category.amount)}</strong>
+                    </li>
+                  ))}
+                </ul>
+              ) : <p>Витрат для аналізу поки немає.</p>}
+            </article>
+            <article>
+              <h3>Можливі ризики</h3>
+              {analysis.risks.length > 0 ? <ul className="ai-analysis-list">{analysis.risks.map((risk) => <li key={risk}>{risk}</li>)}</ul> : <p>Явних ризиків не виявлено.</p>}
+            </article>
+            <article>
+              <h3>Практичні поради</h3>
+              {analysis.recommendations.length > 0 ? <ul className="ai-analysis-list">{analysis.recommendations.map((recommendation) => <li key={recommendation}>{recommendation}</li>)}</ul> : <p>Поради з’являться після додавання операцій.</p>}
+            </article>
+          </div>
+        )}
+      </section>
+
       <section className="panel transaction-form-panel">
         <div className="panel-heading">
           <div>
@@ -392,11 +481,18 @@ function App() {
           </label>
           <label>
             Категорія
-            <input name="category" maxLength="100" value={transactionForm.category} onChange={updateTransactionForm} placeholder="Наприклад, Електрика" required />
+            <select name="category" value={transactionForm.category} onChange={updateTransactionForm}>
+              <option value="Роботи">Роботи</option>
+              <option value="Матеріали">Матеріали</option>
+            </select>
           </label>
           <label>
-            Опис
-            <input name="description" maxLength="255" value={transactionForm.description} onChange={updateTransactionForm} placeholder="Наприклад, Кабель" required />
+            Підкатегорія
+            <input name="subcategory" maxLength="100" value={transactionForm.subcategory} onChange={updateTransactionForm} placeholder="Наприклад, Сантехніка, електрика, стіни або меблі" required />
+          </label>
+          <label>
+            Позиція
+            <input name="description" maxLength="255" value={transactionForm.description} onChange={updateTransactionForm} placeholder="Наприклад, Кабель ВВГнг 3×2,5 або монтаж розеток" required />
           </label>
           <label>
             Дата

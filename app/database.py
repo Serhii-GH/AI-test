@@ -31,8 +31,6 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 metadata = MetaData()
 
-WEB_TRANSACTIONS_CATEGORY = "Веб-операції"
-
 users = Table(
     "users",
     metadata,

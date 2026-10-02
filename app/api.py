@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
@@ -21,7 +22,11 @@ from app.database import (
     delete_user_transaction,
     save_transaction,
     verify_web_login_code,
-    WEB_TRANSACTIONS_CATEGORY,
+)
+from app.gemini_analysis import (
+    GeminiAnalysisError,
+    TransactionAnalysisResponse,
+    analyze_transactions_with_gemini,
 )
 
 
@@ -46,7 +51,8 @@ class FinancialSummaryResponse(BaseModel):
 class CreateTransactionRequest(BaseModel):
     type: Literal["income", "expense"]
     amount: Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)]
-    category: Annotated[str, Field(min_length=1, max_length=100)]
+    category: Literal["Роботи", "Матеріали"]
+    subcategory: Annotated[str, Field(min_length=1, max_length=100)]
     description: Annotated[str, Field(min_length=1, max_length=255)]
     date: date
 
@@ -57,7 +63,7 @@ class CreateTransactionRequest(BaseModel):
             raise ValueError("amount must be a positive number")
         return value
 
-    @field_validator("category", "description")
+    @field_validator("subcategory", "description")
     @classmethod
     def text_must_not_be_blank(cls, value: str) -> str:
         normalized_value = value.strip()
@@ -185,8 +191,8 @@ async def create_transaction(
         telegram_id=telegram_id,
         username=None,
         amount=transaction.amount,
-        main_category_name=WEB_TRANSACTIONS_CATEGORY,
-        subcategory_name=transaction.category,
+        main_category_name=transaction.category,
+        subcategory_name=transaction.subcategory,
         description=transaction.description,
         transaction_type=transaction.type,
         created_at=created_at,
@@ -214,3 +220,19 @@ async def get_summary(
     """Return the authenticated Telegram user's financial totals as JSON."""
     engine: AsyncEngine = request.app.state.database_engine
     return await get_financial_summary(engine, telegram_id)
+
+
+@app.post("/api/ai/analyze-transactions", response_model=TransactionAnalysisResponse)
+async def analyze_transactions(
+    request: Request,
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> TransactionAnalysisResponse:
+    """Analyze the authenticated user's Neon transactions with Gemini on the backend."""
+    engine: AsyncEngine = request.app.state.database_engine
+    transactions = await get_transactions(engine, telegram_id)
+    try:
+        return await asyncio.to_thread(analyze_transactions_with_gemini, transactions)
+    except GeminiAnalysisError as error:
+        if not os.getenv("GEMINI_API_KEY"):
+            raise HTTPException(status_code=503, detail="AI-аналіз тимчасово недоступний.") from error
+        raise HTTPException(status_code=502, detail="Не вдалося отримати коректний AI-аналіз. Спробуйте ще раз.") from error
