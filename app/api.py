@@ -38,6 +38,8 @@ class TransactionResponse(BaseModel):
     main_category: str | None
     subcategory: str
     amount: Decimal
+    exchange_rate: Decimal | None
+    amount_usd: Decimal | None
     description: str | None
     created_at: datetime
 
@@ -51,12 +53,13 @@ class FinancialSummaryResponse(BaseModel):
 class CreateTransactionRequest(BaseModel):
     type: Literal["income", "expense"]
     amount: Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)]
+    exchange_rate: Annotated[Decimal, Field(gt=0, max_digits=10, decimal_places=4)]
     category: Literal["Роботи", "Матеріали"]
     subcategory: Annotated[str, Field(min_length=1, max_length=100)]
     description: Annotated[str, Field(min_length=1, max_length=255)]
     date: date
 
-    @field_validator("amount")
+    @field_validator("amount", "exchange_rate")
     @classmethod
     def amount_must_be_a_positive_finite_number(cls, value: Decimal) -> Decimal:
         if not value.is_finite() or value <= 0:
@@ -191,6 +194,7 @@ async def create_transaction(
         telegram_id=telegram_id,
         username=None,
         amount=transaction.amount,
+        exchange_rate=transaction.exchange_rate,
         main_category_name=transaction.category,
         subcategory_name=transaction.subcategory,
         description=transaction.description,

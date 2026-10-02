@@ -26,7 +26,7 @@ class ExpenseCategoryResponse(BaseModel):
 
 class TransactionAnalysisResponse(BaseModel):
     summary: str = Field(min_length=1, max_length=600)
-    expense_categories: list[ExpenseCategoryResponse] = Field(max_length=20)
+    expense_categories: list[ExpenseCategoryResponse] = Field(max_length=50)
     risks: list[str] = Field(max_length=5)
     recommendations: list[str] = Field(max_length=5)
 

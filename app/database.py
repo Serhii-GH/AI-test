@@ -2,7 +2,7 @@ import os
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 from sqlalchemy import (
     BigInteger,
@@ -65,12 +65,18 @@ transactions = Table(
     Column("user_id", BigInteger, ForeignKey("users.id"), nullable=False),
     Column("category_id", BigInteger, ForeignKey("categories.id"), nullable=False),
     Column("amount", Numeric(12, 2), nullable=False),
+    Column("exchange_rate", Numeric(10, 4)),
+    Column("amount_usd", Numeric(12, 2)),
     Column("transaction_type", String(20), nullable=False, server_default="expense"),
     Column("description", String(255)),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     CheckConstraint(
         "transaction_type IN ('income', 'expense')",
         name="ck_transactions_transaction_type",
+    ),
+    CheckConstraint(
+        "exchange_rate IS NULL OR exchange_rate > 0",
+        name="ck_transactions_exchange_rate_positive",
     ),
 )
 
@@ -146,6 +152,10 @@ async def initialize_database(engine: AsyncEngine) -> None:
                         ALTER TABLE transactions
                             ADD COLUMN IF NOT EXISTS transaction_type VARCHAR(20)
                             NOT NULL DEFAULT 'expense';
+                        ALTER TABLE transactions
+                            ADD COLUMN IF NOT EXISTS exchange_rate NUMERIC(10, 4);
+                        ALTER TABLE transactions
+                            ADD COLUMN IF NOT EXISTS amount_usd NUMERIC(12, 2);
                     END IF;
                 END $$;
                 """
@@ -163,6 +173,25 @@ async def initialize_database(engine: AsyncEngine) -> None:
                     name VARCHAR(100) PRIMARY KEY,
                     applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
                 )
+                """
+            )
+        )
+        await connection.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conrelid = 'transactions'::regclass
+                          AND conname = 'ck_transactions_exchange_rate_positive'
+                    ) THEN
+                        ALTER TABLE transactions
+                            ADD CONSTRAINT ck_transactions_exchange_rate_positive
+                            CHECK (exchange_rate IS NULL OR exchange_rate > 0);
+                    END IF;
+                END $$;
                 """
             )
         )
@@ -264,6 +293,7 @@ async def save_transaction(
     subcategory_name: str,
     description: str,
     transaction_type: str,
+    exchange_rate: Decimal | None = None,
     created_at: datetime | None = None,
 ) -> dict[str, object]:
     """Create an income or expense in a two-level category hierarchy."""
@@ -319,6 +349,12 @@ async def save_transaction(
             "transaction_type": transaction_type,
             "description": description,
         }
+        if exchange_rate is not None:
+            transaction_values["exchange_rate"] = exchange_rate
+            transaction_values["amount_usd"] = (amount / exchange_rate).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
         if created_at is not None:
             transaction_values["created_at"] = created_at
 
@@ -331,6 +367,8 @@ async def save_transaction(
                 transactions.c.category_id,
                 transactions.c.transaction_type,
                 transactions.c.amount,
+                transactions.c.exchange_rate,
+                transactions.c.amount_usd,
                 transactions.c.description,
                 transactions.c.created_at,
             )
@@ -453,6 +491,8 @@ async def get_transactions(engine: AsyncEngine, telegram_id: int) -> list[dict[s
             main_categories.c.name.label("main_category"),
             categories.c.name.label("subcategory"),
             transactions.c.amount,
+            transactions.c.exchange_rate,
+            transactions.c.amount_usd,
             transactions.c.description,
             transactions.c.created_at,
         )
@@ -526,6 +566,8 @@ async def get_user_transactions(
             main_categories.c.name.label("main_category"),
             categories.c.name.label("subcategory"),
             transactions.c.amount,
+            transactions.c.exchange_rate,
+            transactions.c.amount_usd,
             transactions.c.description,
             transactions.c.created_at,
         )
@@ -562,6 +604,8 @@ async def get_user_transaction(
             main_categories.c.name.label("main_category"),
             categories.c.name.label("subcategory"),
             transactions.c.amount,
+            transactions.c.exchange_rate,
+            transactions.c.amount_usd,
             transactions.c.description,
         )
         .select_from(

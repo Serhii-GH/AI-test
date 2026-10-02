@@ -7,6 +7,12 @@ const currencyFormatter = new Intl.NumberFormat('uk-UA', {
   maximumFractionDigits: 2,
 })
 
+const usdFormatter = new Intl.NumberFormat('uk-UA', {
+  style: 'currency',
+  currency: 'USD',
+  maximumFractionDigits: 2,
+})
+
 const dateFormatter = new Intl.DateTimeFormat('uk-UA', {
   day: '2-digit',
   month: 'short',
@@ -14,6 +20,7 @@ const dateFormatter = new Intl.DateTimeFormat('uk-UA', {
 })
 
 const barColors = ['#c65b3f', '#d5864c', '#8d9a70', '#556b63', '#b6a176', '#7d6656']
+const TRANSACTION_PAGE_SIZE = 10
 
 function getTodayForInput() {
   const now = new Date()
@@ -25,6 +32,7 @@ function createEmptyTransactionForm() {
   return {
     type: 'expense',
     amount: '',
+    exchange_rate: '',
     category: 'Роботи',
     subcategory: '',
     description: '',
@@ -34,6 +42,10 @@ function createEmptyTransactionForm() {
 
 function formatCurrency(value) {
   return currencyFormatter.format(Number(value ?? 0))
+}
+
+function formatUsd(value) {
+  return usdFormatter.format(Number(value ?? 0))
 }
 
 function formatDate(value) {
@@ -56,6 +68,7 @@ function App() {
   const [transactionActionError, setTransactionActionError] = useState('')
   const [deletingTransactionId, setDeletingTransactionId] = useState(null)
   const [transactionFilter, setTransactionFilter] = useState('all')
+  const [visibleTransactionLimit, setVisibleTransactionLimit] = useState(TRANSACTION_PAGE_SIZE)
   const [analysis, setAnalysis] = useState(null)
   const [analysisStatus, setAnalysisStatus] = useState('idle')
   const [analysisError, setAnalysisError] = useState('')
@@ -188,9 +201,11 @@ function App() {
     }
 
     const amount = transactionForm.amount.trim()
+    const exchangeRate = transactionForm.exchange_rate.trim()
     const category = transactionForm.category.trim()
     const subcategory = transactionForm.subcategory.trim()
     const parsedAmount = Number(amount)
+    const parsedExchangeRate = Number(exchangeRate)
 
     if (!amount) {
       setTransactionError('Вкажіть суму операції.')
@@ -212,6 +227,10 @@ function App() {
       setTransactionError('Оберіть категорію «Роботи» або «Матеріали».')
       return
     }
+    if (!exchangeRate || !Number.isFinite(parsedExchangeRate) || parsedExchangeRate <= 0) {
+      setTransactionError('Вкажіть додатний курс USD у гривнях на дату операції.')
+      return
+    }
     if (!subcategory) {
       setTransactionError('Вкажіть підкатегорію операції.')
       return
@@ -227,6 +246,7 @@ function App() {
         body: JSON.stringify({
           ...transactionForm,
           amount,
+          exchange_rate: exchangeRate,
           category,
           subcategory,
         }),
@@ -327,6 +347,8 @@ function App() {
   const visibleTransactions = transactionFilter === 'all'
     ? transactions
     : transactions.filter((transaction) => transaction.transaction_type === transactionFilter)
+  const displayedTransactions = visibleTransactions.slice(0, visibleTransactionLimit)
+  const hasMoreTransactions = displayedTransactions.length < visibleTransactions.length
   const isLoading = status === 'loading'
 
   return (
@@ -480,6 +502,10 @@ function App() {
             <input name="amount" type="number" min="0.01" step="0.01" value={transactionForm.amount} onChange={updateTransactionForm} required />
           </label>
           <label>
+            Курс USD, грн
+            <input name="exchange_rate" type="number" min="0.0001" step="0.0001" value={transactionForm.exchange_rate} onChange={updateTransactionForm} placeholder="Наприклад, 41.50" required />
+          </label>
+          <label>
             Категорія
             <select name="category" value={transactionForm.category} onChange={updateTransactionForm}>
               <option value="Роботи">Роботи</option>
@@ -559,7 +585,10 @@ function App() {
                     className={transactionFilter === filter ? 'filter-button filter-button-active' : 'filter-button'}
                     key={filter}
                     type="button"
-                    onClick={() => setTransactionFilter(filter)}
+                    onClick={() => {
+                      setTransactionFilter(filter)
+                      setVisibleTransactionLimit(TRANSACTION_PAGE_SIZE)
+                    }}
                   >
                     {label}
                   </button>
@@ -569,7 +598,8 @@ function App() {
               {isLoading ? (
                 <div className="list-placeholder">Завантажуємо операції…</div>
               ) : visibleTransactions.length > 0 ? (
-                <div className="transaction-table-wrapper">
+                <>
+                  <div className="transaction-table-wrapper">
                   <table className="transaction-table">
                     <caption>Останні фінансові операції</caption>
                     <thead>
@@ -579,12 +609,13 @@ function App() {
                         <th scope="col">Категорія</th>
                         <th scope="col">Підкатегорія</th>
                         <th scope="col">Позиція</th>
-                        <th scope="col" className="amount-heading">Сума</th>
+                        <th scope="col" className="amount-heading">Сума, грн</th>
+                        <th scope="col" className="amount-heading">Сума, $</th>
                         <th scope="col"><span className="visually-hidden">Дія</span></th>
                       </tr>
                     </thead>
                     <tbody>
-                      {visibleTransactions.slice(0, 8).map((transaction) => {
+                      {displayedTransactions.map((transaction) => {
                         const isIncome = transaction.transaction_type === 'income'
 
                         return (
@@ -601,6 +632,12 @@ function App() {
                             <td className={isIncome ? 'table-amount income-amount' : 'table-amount'}>
                               {isIncome ? '+' : '−'}{formatCurrency(transaction.amount)}
                             </td>
+                            <td className={isIncome ? 'table-amount usd-amount income-amount' : 'table-amount usd-amount'}>
+                              {transaction.amount_usd == null ? '—' : <>
+                                {isIncome ? '+' : '−'}{formatUsd(transaction.amount_usd)}
+                                <small>Курс: {Number(transaction.exchange_rate).toFixed(4)} грн/$</small>
+                              </>}
+                            </td>
                             <td className="transaction-action-cell">
                               <button
                                 className="delete-transaction-button"
@@ -616,7 +653,29 @@ function App() {
                       })}
                     </tbody>
                   </table>
-                </div>
+                  </div>
+                  {hasMoreTransactions && (
+                    <div className="transaction-pagination">
+                      <p>Показано {displayedTransactions.length} з {visibleTransactions.length} операцій</p>
+                      <div>
+                        <button
+                          className="show-more-button"
+                          type="button"
+                          onClick={() => setVisibleTransactionLimit((limit) => limit + TRANSACTION_PAGE_SIZE)}
+                        >
+                          Показати ще
+                        </button>
+                        <button
+                          className="show-all-button"
+                          type="button"
+                          onClick={() => setVisibleTransactionLimit(visibleTransactions.length)}
+                        >
+                          Показати всі
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
               ) : (
                 <div className="empty-state">За цим фільтром операцій поки немає.</div>
               )}
