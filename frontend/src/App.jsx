@@ -167,6 +167,8 @@ function App() {
   const [chatInput, setChatInput] = useState('')
   const [chatStatus, setChatStatus] = useState('idle')
   const [chatError, setChatError] = useState('')
+  const [pendingActions, setPendingActions] = useState([])
+  const [resolvingActionId, setResolvingActionId] = useState(null)
 
   const loadProjects = useCallback(async () => {
     if (!telegramId) {
@@ -324,6 +326,7 @@ function App() {
 
     setSelectedChatThreadId(null)
     setChatMessages([])
+    setPendingActions([])
     setChatError('')
     const loadTimer = window.setTimeout(() => { void loadChatThreads() }, 0)
     return () => window.clearTimeout(loadTimer)
@@ -383,6 +386,8 @@ function App() {
     setChatInput('')
     setChatStatus('idle')
     setChatError('')
+    setPendingActions([])
+    setResolvingActionId(null)
     setStatus('idle')
     setAuthStatus('unauthenticated')
   }
@@ -565,6 +570,7 @@ function App() {
     }
     setSelectedChatThreadId(null)
     setChatMessages([])
+    setPendingActions([])
     setChatInput('')
     setChatError('')
   }
@@ -585,6 +591,7 @@ function App() {
       const thread = await response.json()
       setSelectedChatThreadId(thread.id)
       setChatMessages(thread.messages.map((message, index) => ({ ...message, id: `${thread.id}-${index}` })))
+      setPendingActions(thread.pending_actions ?? [])
     } catch (requestError) {
       setChatError(requestError.message || 'Не вдалося відкрити діалог.')
     } finally {
@@ -640,6 +647,13 @@ function App() {
               : chatMessage
           )))
         }
+        if (eventName === 'pending_action' && payload.action?.id) {
+          setPendingActions((currentActions) => (
+            currentActions.some((action) => action.id === payload.action.id)
+              ? currentActions
+              : [...currentActions, payload.action]
+          ))
+        }
         if (eventName === 'error') {
           streamError = typeof payload.message === 'string' ? payload.message : 'Не вдалося сформувати відповідь.'
         }
@@ -663,6 +677,35 @@ function App() {
       setChatError(requestError.message || 'Не вдалося сформувати відповідь AI-помічника.')
     } finally {
       setChatStatus('idle')
+    }
+  }
+
+  async function resolvePendingAction(actionId, operation) {
+    if (!activeProjectId || resolvingActionId) {
+      return
+    }
+
+    setResolvingActionId(actionId)
+    setChatError('')
+    try {
+      const response = await fetch(`/api/ai/actions/${actionId}/${operation}?project_id=${activeProjectId}`, {
+        method: 'POST',
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(typeof body?.detail === 'string' ? body.detail : 'Не вдалося обробити запропоновану дію.')
+      }
+      setPendingActions((currentActions) => currentActions.filter((action) => action.id !== actionId))
+      if (operation === 'confirm') {
+        setAnalysis(null)
+        setAnalysisStatus('idle')
+        await loadDashboard(false)
+      }
+      await loadChatThreads()
+    } catch (requestError) {
+      setChatError(requestError.message || 'Не вдалося обробити запропоновану дію.')
+    } finally {
+      setResolvingActionId(null)
     }
   }
 
@@ -827,9 +870,9 @@ function App() {
       <section className="panel ai-chat-panel" aria-label="AI-помічник">
         <div className="panel-heading ai-chat-heading">
           <div>
-            <p className="panel-kicker">Gemini AI · read-only</p>
+            <p className="panel-kicker">Gemini AI · контрольовані дії</p>
             <h2>AI-помічник фінансів</h2>
-            <p className="ai-chat-retention">Контекст діалогу зберігається 7 днів. Помічник може лише читати й аналізувати дані.</p>
+            <p className="ai-chat-retention">Контекст діалогу зберігається 7 днів. Будь-яка запропонована зміна виконується лише після вашого підтвердження.</p>
           </div>
           <button className="new-chat-button" type="button" onClick={startNewChat} disabled={chatStatus === 'sending' || !activeProjectId}>
             + Новий чат
@@ -869,6 +912,46 @@ function App() {
                 </article>
               ))}
             </div>
+            {pendingActions.length > 0 && (
+              <section className="pending-actions" aria-label="Запропоновані AI-дії">
+                {pendingActions.map((action) => (
+                  <article className="pending-action-card" key={action.id}>
+                    <div className="pending-action-heading">
+                      <div>
+                        <p className="panel-kicker">Запропонована дія</p>
+                        <h3>{action.payload.type === 'expense' ? 'Створити витрату' : 'Створити дохід'}</h3>
+                      </div>
+                      <span className="pending-action-status">Потрібне підтвердження</span>
+                    </div>
+                    <dl className="pending-action-details">
+                      <div><dt>Сума</dt><dd>{formatCurrency(action.payload.amount)}</dd></div>
+                      <div><dt>Категорія</dt><dd>{action.payload.category} → {action.payload.subcategory}</dd></div>
+                      <div><dt>Дата</dt><dd>{formatDate(action.payload.date)}</dd></div>
+                      <div><dt>Курс USD</dt><dd>{Number(action.payload.exchange_rate).toLocaleString('uk-UA')}</dd></div>
+                      <div className="pending-action-description"><dt>Опис</dt><dd>{action.payload.description}</dd></div>
+                    </dl>
+                    <div className="pending-action-buttons">
+                      <button
+                        className="confirm-action-button"
+                        type="button"
+                        onClick={() => { void resolvePendingAction(action.id, 'confirm') }}
+                        disabled={Boolean(resolvingActionId) || chatStatus === 'sending'}
+                      >
+                        {resolvingActionId === action.id ? 'Обробляємо…' : 'Підтвердити'}
+                      </button>
+                      <button
+                        className="cancel-action-button"
+                        type="button"
+                        onClick={() => { void resolvePendingAction(action.id, 'cancel') }}
+                        disabled={Boolean(resolvingActionId) || chatStatus === 'sending'}
+                      >
+                        Скасувати
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </section>
+            )}
             {chatError && <p className="transaction-form-error chat-error" role="alert">{chatError}</p>}
             <form className="chat-input-form" onSubmit={sendChatMessage}>
               <label className="visually-hidden" htmlFor="ai-chat-message">Запит до AI-помічника</label>
