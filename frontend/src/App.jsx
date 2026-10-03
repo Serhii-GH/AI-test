@@ -52,6 +52,62 @@ function formatDate(value) {
   return value ? dateFormatter.format(new Date(value)) : '—'
 }
 
+function sortTotals(totals) {
+  return [...totals.entries()]
+    .map(([label, amount]) => ({ label, amount }))
+    .sort((left, right) => right.amount - left.amount || left.label.localeCompare(right.label, 'uk'))
+}
+
+function getSubcategoryTotals(transactions, mainCategory) {
+  const totals = new Map()
+  transactions
+    .filter((transaction) => transaction.transaction_type === 'expense' && transaction.main_category === mainCategory)
+    .forEach((transaction) => {
+      const label = transaction.subcategory || 'Без підкатегорії'
+      totals.set(label, (totals.get(label) ?? 0) + Number(transaction.amount))
+    })
+  return sortTotals(totals)
+}
+
+function ExpenseDistributionChart({ title, description, totals, isLoading, emptyMessage }) {
+  const largestTotal = Math.max(...totals.map((item) => item.amount), 0)
+
+  return (
+    <article className="distribution-card">
+      <div className="distribution-card-heading">
+        <div>
+          <p className="panel-kicker">{description}</p>
+          <h3>{title}</h3>
+        </div>
+        <span className="distribution-count">{totals.length}</span>
+      </div>
+      {isLoading ? (
+        <div className="distribution-placeholder">Завантажуємо діаграму…</div>
+      ) : totals.length > 0 ? (
+        <div className="distribution-bars" aria-label={title}>
+          {totals.map((item, index) => (
+            <div className="distribution-row" key={item.label}>
+              <div className="distribution-label-row">
+                <span>{item.label}</span>
+                <strong>{formatCurrency(item.amount)}</strong>
+              </div>
+              <div className="distribution-track">
+                <div
+                  className="distribution-fill"
+                  style={{
+                    width: `${Math.max((item.amount / largestTotal) * 100, 5)}%`,
+                    '--bar-color': barColors[index % barColors.length],
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : <div className="distribution-placeholder">{emptyMessage}</div>}
+    </article>
+  )
+}
+
 function App() {
   const [telegramId, setTelegramId] = useState(null)
   const [telegramUsername, setTelegramUsername] = useState(null)
@@ -438,25 +494,26 @@ function App() {
     }
   }
 
-  const categoryTotals = useMemo(() => {
-    const totals = new Map()
-
+  const mainCategoryTotals = useMemo(() => {
+    const totals = new Map([['Роботи', 0], ['Матеріали', 0]])
     transactions
       .filter((transaction) => transaction.transaction_type === 'expense')
       .forEach((transaction) => {
-      const mainCategory = transaction.main_category ?? 'Без основної категорії'
-      const subcategory = transaction.subcategory
-      const label = `${mainCategory} · ${subcategory}`
-        totals.set(label, (totals.get(label) ?? 0) + Number(transaction.amount))
+        if (totals.has(transaction.main_category)) {
+          totals.set(transaction.main_category, totals.get(transaction.main_category) + Number(transaction.amount))
+        }
       })
-
-    return [...totals.entries()]
-      .map(([label, amount]) => ({ label, amount }))
-      .sort((left, right) => right.amount - left.amount)
-      .slice(0, 6)
+    return sortTotals(new Map([...totals].filter(([, amount]) => amount > 0)))
   }, [transactions])
 
-  const largestCategoryTotal = Math.max(...categoryTotals.map((item) => item.amount), 0)
+  const workSubcategoryTotals = useMemo(
+    () => getSubcategoryTotals(transactions, 'Роботи'),
+    [transactions],
+  )
+  const materialSubcategoryTotals = useMemo(
+    () => getSubcategoryTotals(transactions, 'Матеріали'),
+    [transactions],
+  )
   const visibleTransactions = transactionFilter === 'all'
     ? transactions
     : transactions.filter((transaction) => transaction.transaction_type === transactionFilter)
@@ -611,6 +668,11 @@ function App() {
           </button>
         </div>
 
+        {analysis && analysisStatus === 'ready' && (
+          <p className="ai-analysis-cache-status">
+            {analysis.cached ? 'Показано збережений AI-аналіз для поточних даних.' : 'AI-аналіз щойно оновлено.'}
+          </p>
+        )}
         {analysisStatus === 'loading' && <p className="ai-analysis-loading">Gemini аналізує ваші операції…</p>}
         {analysisStatus === 'error' && <p className="transaction-form-error" role="alert">{analysisError}</p>}
 
@@ -625,9 +687,19 @@ function App() {
               {analysis.expense_categories.length > 0 ? (
                 <ul className="ai-analysis-list category-analysis-list">
                   {analysis.expense_categories.map((category) => (
-                    <li key={category.category}>
-                      <span>{category.category}</span>
-                      <strong>{formatCurrency(category.amount)}</strong>
+                    <li className="category-analysis-group" key={category.category}>
+                      <div className="category-analysis-main">
+                        <strong>{category.category}</strong>
+                        <strong>{formatCurrency(category.amount)}</strong>
+                      </div>
+                      <ul className="category-analysis-subcategories">
+                        {(category.subcategories ?? []).map((subcategory) => (
+                          <li key={subcategory.category}>
+                            <span>{subcategory.category}</span>
+                            <strong>{formatCurrency(subcategory.amount)}</strong>
+                          </li>
+                        ))}
+                      </ul>
                     </li>
                   ))}
                 </ul>
@@ -695,39 +767,38 @@ function App() {
       </section>
 
       <section className="content-grid">
-            <article className="panel chart-panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="panel-kicker">Структура витрат</p>
-                  <h2>Найбільші категорії</h2>
-                </div>
-                <span className="live-indicator"><i /> Дані з API</span>
-              </div>
-
-              {isLoading ? (
-                <div className="chart-placeholder">Завантажуємо діаграму…</div>
-              ) : categoryTotals.length > 0 ? (
-                <div className="bar-chart" aria-label="Стовпчикова діаграма витрат за категоріями">
-                  {categoryTotals.map((category, index) => (
-                    <div className="bar-column" key={category.label}>
-                      <span className="bar-value">{formatCurrency(category.amount)}</span>
-                      <div className="bar-track">
-                        <div
-                          className="bar-fill"
-                          style={{
-                            height: `${Math.max((category.amount / largestCategoryTotal) * 100, 7)}%`,
-                            '--bar-color': barColors[index % barColors.length],
-                          }}
-                        />
-                      </div>
-                      <span className="bar-label">{category.label}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="empty-state">Ще немає витрат. Додайте першу через Telegram-бота.</div>
-              )}
-            </article>
+        <section className="panel chart-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="panel-kicker">Структура витрат</p>
+              <h2>Основні категорії витрат</h2>
+            </div>
+            <span className="live-indicator"><i /> Дані з API</span>
+          </div>
+          <div className="distribution-grid">
+            <ExpenseDistributionChart
+              title="Роботи / матеріали"
+              description="Загальний розподіл"
+              totals={mainCategoryTotals}
+              isLoading={isLoading}
+              emptyMessage="Ще немає витрат за основними категоріями."
+            />
+            <ExpenseDistributionChart
+              title="Роботи за підкатегоріями"
+              description="Деталізація робіт"
+              totals={workSubcategoryTotals}
+              isLoading={isLoading}
+              emptyMessage="Ще немає витрат у категорії «Роботи»."
+            />
+            <ExpenseDistributionChart
+              title="Матеріали за підкатегоріями"
+              description="Деталізація матеріалів"
+              totals={materialSubcategoryTotals}
+              isLoading={isLoading}
+              emptyMessage="Ще немає витрат у категорії «Матеріали»."
+            />
+          </div>
+        </section>
 
             <article className="panel recent-panel">
               <div className="panel-heading">

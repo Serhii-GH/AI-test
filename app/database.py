@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     MetaData,
     Numeric,
     String,
@@ -112,6 +113,43 @@ web_sessions = Table(
     Column("token_hash", String(64), nullable=False, unique=True),
     Column("expires_at", DateTime(timezone=True), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+ai_analysis_cache = Table(
+    "ai_analysis_cache",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("project_id", BigInteger, ForeignKey("projects.id"), nullable=False),
+    Column("ledger_hash", String(64), nullable=False),
+    Column("prompt_version", String(100), nullable=False),
+    Column("analysis", JSON, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    UniqueConstraint(
+        "project_id",
+        "ledger_hash",
+        "prompt_version",
+        name="uq_ai_analysis_cache_project_ledger_prompt",
+    ),
+)
+
+ai_analysis_metrics = Table(
+    "ai_analysis_metrics",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("project_id", BigInteger, ForeignKey("projects.id"), nullable=False),
+    Column("ledger_hash", String(64), nullable=False),
+    Column("prompt_version", String(100), nullable=False),
+    Column("model", String(100)),
+    Column("result_source", String(20), nullable=False),
+    Column("status", String(20), nullable=False),
+    Column("input_tokens", Integer),
+    Column("output_tokens", Integer),
+    Column("thought_tokens", Integer),
+    Column("cached_tokens", Integer),
+    Column("latency_ms", Integer),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Index("ix_ai_analysis_metrics_project_created", "project_id", "created_at"),
 )
 
 
@@ -677,6 +715,82 @@ async def get_transactions(
     async with engine.connect() as connection:
         result = await connection.execute(statement)
         return [dict(row) for row in result.mappings().all()]
+
+
+async def get_cached_ai_analysis(
+    engine: AsyncEngine,
+    project_id: int,
+    ledger_hash: str,
+    prompt_version: str,
+) -> dict[str, object] | None:
+    """Return a narrative generated for exactly this project, ledger, and prompt."""
+    statement = (
+        select(ai_analysis_cache.c.analysis, ai_analysis_cache.c.created_at)
+        .where(
+            ai_analysis_cache.c.project_id == project_id,
+            ai_analysis_cache.c.ledger_hash == ledger_hash,
+            ai_analysis_cache.c.prompt_version == prompt_version,
+        )
+        .limit(1)
+    )
+    async with engine.connect() as connection:
+        row = (await connection.execute(statement)).mappings().one_or_none()
+        return dict(row) if row is not None else None
+
+
+async def save_cached_ai_analysis(
+    engine: AsyncEngine,
+    project_id: int,
+    ledger_hash: str,
+    prompt_version: str,
+    analysis: dict[str, object],
+) -> None:
+    """Persist a validated Gemini narrative for future identical requests."""
+    statement = insert(ai_analysis_cache).values(
+        project_id=project_id,
+        ledger_hash=ledger_hash,
+        prompt_version=prompt_version,
+        analysis=analysis,
+    ).on_conflict_do_update(
+        constraint="uq_ai_analysis_cache_project_ledger_prompt",
+        set_={"analysis": analysis, "updated_at": func.now()},
+    )
+    async with engine.begin() as connection:
+        await connection.execute(statement)
+
+
+async def record_ai_analysis_metric(
+    engine: AsyncEngine,
+    *,
+    project_id: int,
+    ledger_hash: str,
+    prompt_version: str,
+    result_source: str,
+    status: str,
+    model: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    thought_tokens: int | None = None,
+    cached_tokens: int | None = None,
+    latency_ms: int | None = None,
+) -> None:
+    """Store usage and latency for cost monitoring without storing prompt data."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(ai_analysis_metrics).values(
+                project_id=project_id,
+                ledger_hash=ledger_hash,
+                prompt_version=prompt_version,
+                model=model,
+                result_source=result_source,
+                status=status,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                thought_tokens=thought_tokens,
+                cached_tokens=cached_tokens,
+                latency_ms=latency_ms,
+            )
+        )
 
 
 async def get_financial_summary(
