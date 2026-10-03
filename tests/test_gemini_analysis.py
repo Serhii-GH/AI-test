@@ -7,6 +7,7 @@ import unittest
 from app.gemini_analysis import (
     GeminiTransactionAnalysis,
     build_dashboard_analysis,
+    estimate_prepared_analysis_tokens,
     insufficient_data_analysis,
     prepare_transaction_analysis,
 )
@@ -107,6 +108,23 @@ class GeminiAnalysisTests(unittest.TestCase):
         self.assertIn("Обмеження:", prompt)
         self.assertIn("українською", prompt)
         self.assertIn("<facts>", prompt)
+
+    def test_tiktoken_estimate_uses_prompt_and_output_budget(self) -> None:
+        prepared = prepare_transaction_analysis([
+            transaction(1, "100.00", "Стіни", "Ґрунтовка"),
+            transaction(2, "250.00", "Підлога", "Плитка"),
+            transaction(3, "50.00", "Стіни", "Клей"),
+        ])
+
+        estimate = estimate_prepared_analysis_tokens(prepared)
+
+        self.assertEqual(estimate.tokenizer, "cl100k_base")
+        self.assertGreater(estimate.input_tokens, 0)
+        self.assertGreater(estimate.output_token_budget, 0)
+        self.assertEqual(
+            estimate.potential_total_tokens,
+            estimate.input_tokens + estimate.output_token_budget,
+        )
 
 
 if __name__ == "__main__":

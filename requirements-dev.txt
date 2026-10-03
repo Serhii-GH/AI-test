@@ -1,2 +1,1 @@
 -r requirements.txt
-tiktoken>=0.9,<1.0

@@ -12,6 +12,7 @@ from typing import Annotated, Any
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field, ValidationError
+import tiktoken
 
 from app.prompts.transaction_analysis import PROMPT_VERSION, build_transaction_analysis_prompt
 
@@ -79,6 +80,16 @@ class GeminiCallResult:
     analysis: GeminiTransactionAnalysis
     usage: GeminiUsage
     model: str
+
+
+@dataclass(frozen=True)
+class TokenEstimate:
+    """Local token estimate; Gemini billing remains authoritative."""
+
+    input_tokens: int
+    output_token_budget: int
+    potential_total_tokens: int
+    tokenizer: str = "cl100k_base"
 
 
 def _format_category(transaction: dict[str, object]) -> str:
@@ -291,6 +302,18 @@ def _read_int_setting(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def estimate_prepared_analysis_tokens(prepared: PreparedTransactionAnalysis) -> TokenEstimate:
+    """Estimate the prompt and configured output budget without calling Gemini."""
+    prompt = build_transaction_analysis_prompt(prepared.facts)
+    input_tokens = len(tiktoken.get_encoding("cl100k_base").encode(prompt))
+    output_token_budget = _read_int_setting("GEMINI_MAX_OUTPUT_TOKENS", 700)
+    return TokenEstimate(
+        input_tokens=input_tokens,
+        output_token_budget=output_token_budget,
+        potential_total_tokens=input_tokens + output_token_budget,
+    )
 
 
 def analyze_prepared_transactions_with_gemini(

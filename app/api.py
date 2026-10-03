@@ -40,6 +40,7 @@ from app.gemini_analysis import (
     TransactionAnalysisResponse,
     analyze_prepared_transactions_with_gemini,
     build_dashboard_analysis,
+    estimate_prepared_analysis_tokens,
     insufficient_data_analysis,
     prepare_transaction_analysis,
 )
@@ -68,6 +69,14 @@ class FinancialSummaryResponse(BaseModel):
     total_income: Decimal
     total_expense: Decimal
     balance: Decimal
+
+
+class TokenEstimateResponse(BaseModel):
+    input_tokens: int = Field(ge=0)
+    output_token_budget: int = Field(ge=0)
+    potential_total_tokens: int = Field(ge=0)
+    tokenizer: str
+    note: str
 
 
 class ProjectResponse(BaseModel):
@@ -331,6 +340,26 @@ async def get_summary(
     engine: AsyncEngine = request.app.state.database_engine
     await require_user_project(engine, telegram_id, project_id)
     return await get_financial_summary(engine, telegram_id, project_id)
+
+
+@app.get("/api/ai/token-estimate", response_model=TokenEstimateResponse)
+async def estimate_ai_tokens(
+    request: Request,
+    project_id: Annotated[int, Query(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> TokenEstimateResponse:
+    """Estimate the next analysis request locally without calling Gemini."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    transactions = await get_transactions(engine, telegram_id, project_id)
+    estimate = estimate_prepared_analysis_tokens(prepare_transaction_analysis(transactions))
+    return TokenEstimateResponse(
+        input_tokens=estimate.input_tokens,
+        output_token_budget=estimate.output_token_budget,
+        potential_total_tokens=estimate.potential_total_tokens,
+        tokenizer=estimate.tokenizer,
+        note="Оцінка tiktoken; фактичні токени Gemini можуть відрізнятися.",
+    )
 
 
 @app.post("/api/ai/analyze-transactions", response_model=TransactionAnalysisResponse)
