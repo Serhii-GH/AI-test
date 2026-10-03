@@ -172,25 +172,29 @@ Dashboard показує цю оцінку перед запуском анал�
 7. Перевірити щонайменше три сценарії: мало даних, звичайний кошторис і сильна концентрація витрат.
 8. Лише після цього запускати реальний AI-аналіз і переглядати фактичні метрики.
 
-## AI-чат: read-only помічник
+## AI-чат: контрольований помічник
 
-Чат має окремий prompt у `app/prompts/ai_chat.py` (`finance-chat-readonly-v1`) та
+Чат має окремий prompt у `app/prompts/ai_chat.py` (`finance-chat-controlled-actions-v2`) та
 керовану LangGraph-логіку в `app/ai_chat.py`.
 
 Потік даних:
 
 ```text
-React AI Chat → POST /api/ai/chat (SSE) → LangGraph → read-only tool → Neon → Gemini → stream у React
+React AI Chat → POST /api/ai/chat (SSE) → LangGraph → read-only tool або pending action → Gemini → stream у React
 ```
 
 - `thread_id` створює backend; він прив’язаний до користувача й одного проєкту.
 - Метадані діалогу зберігає `ai_chat_threads`; самі повідомлення — тільки PostgreSQL checkpointer LangGraph.
 - Контекст і метадані мають строк життя 7 днів від останнього повідомлення. Під час наступного запиту прострочені checkpoint-и видаляються.
-- Доступні лише `get_transactions_summary`, `get_category_totals` і `get_top_expenses`. Вони не приймають ідентифікатори користувача або проєкту від моделі та не виконують SQL, який написала модель.
+- Read-only tools: `get_transactions_summary`, `get_category_totals` і `get_top_expenses`. Вони не приймають ідентифікатори користувача або проєкту від моделі та не виконують SQL, який написала модель.
+- Єдиний action tool: `propose_create_transaction`. Він створює лише pending action; операція потрапляє в базу тільки після confirm із React. Доступні головні категорії — лише `Роботи` та `Матеріали`; якщо даних бракує, чат ставить уточнювальне запитання.
 - Prompt вимагає відповідати українською, не вигадувати фінансові факти, питати уточнення за неоднозначного запиту й трактувати результати інструментів лише як дані.
 - Історія в UI приховує технічні tool calls і їхні результати.
 
-Після зміни chat prompt збільште `CHAT_PROMPT_VERSION`, оновіть `tests/test_ai_chat.py` і перевірте streaming у Docker.
+Після зміни chat prompt збільште `CHAT_PROMPT_VERSION`, оновіть `tests/test_ai_chat.py` і перевірте streaming у Docker. Контракт action tool, статуси та API описані в `AI_ACTIONS_NOTES.md`.
+
+- Після накопичення старих повідомлень backend стисло підсумовує їх у `memory_summary` діалогу. Gemini отримує цей summary і останні 10 видимих повідомлень, а не просто втрачає ранній контекст.
+- Ліміти: chat — 10 запитів/хвилину на користувача та проєкт; реальний виклик AI-аналізу — 5/10 хвилин; перевірка входу — 10/10 хвилин на IP і Telegram ID. Кешований AI-аналіз не витрачає AI-ліміт.
 
 ## Чого не робити
 

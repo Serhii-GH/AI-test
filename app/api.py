@@ -18,8 +18,10 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.ai_actions import PendingActionResponse, TransactionActionPayload, pending_action_response
 from app.ai_chat import (
     FinanceChatError,
+    compact_chat_memory_if_needed,
     create_finance_chat_graph,
     message_content_to_text,
     serialize_visible_messages,
@@ -30,6 +32,9 @@ from app.database import (
     create_user_project,
     create_web_session,
     create_database_engine,
+    claim_pending_ai_action,
+    confirm_pending_create_transaction_action,
+    consume_api_rate_limit,
     delete_ai_chat_threads,
     delete_web_session,
     get_ai_chat_thread,
@@ -41,12 +46,15 @@ from app.database import (
     get_web_session_telegram_id,
     initialize_database,
     list_expired_ai_chat_thread_ids,
+    list_pending_ai_actions,
     list_ai_chat_threads,
     list_user_projects,
     record_ai_analysis_metric,
+    record_ai_action_audit,
     save_cached_ai_analysis,
     delete_user_transaction,
     save_transaction,
+    save_ai_chat_memory_summary,
     touch_ai_chat_thread,
     verify_web_login_code,
 )
@@ -113,30 +121,8 @@ class CreateProjectRequest(BaseModel):
         return normalized_value
 
 
-class CreateTransactionRequest(BaseModel):
+class CreateTransactionRequest(TransactionActionPayload):
     project_id: Annotated[int, Field(gt=0)]
-    type: Literal["income", "expense"]
-    amount: Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)]
-    exchange_rate: Annotated[Decimal, Field(gt=0, max_digits=10, decimal_places=4)]
-    category: Literal["Роботи", "Матеріали"]
-    subcategory: Annotated[str, Field(min_length=1, max_length=100)]
-    description: Annotated[str, Field(min_length=1, max_length=255)]
-    date: date
-
-    @field_validator("amount", "exchange_rate")
-    @classmethod
-    def amount_must_be_a_positive_finite_number(cls, value: Decimal) -> Decimal:
-        if not value.is_finite() or value <= 0:
-            raise ValueError("amount must be a positive number")
-        return value
-
-    @field_validator("subcategory", "description")
-    @classmethod
-    def text_must_not_be_blank(cls, value: str) -> str:
-        normalized_value = value.strip()
-        if not normalized_value:
-            raise ValueError("value must not be blank")
-        return normalized_value
 
 
 class VerifyLoginRequest(BaseModel):
@@ -173,15 +159,56 @@ class ChatThreadResponse(BaseModel):
 
 class ChatHistoryResponse(ChatThreadResponse):
     messages: list[dict[str, str]]
+    pending_actions: list[PendingActionResponse]
+
+
+class ActionExecutionResponse(BaseModel):
+    action: PendingActionResponse
+    transaction: TransactionResponse | None = None
 
 
 SESSION_COOKIE_NAME = "admin_session"
 SESSION_DURATION_SECONDS = 7 * 24 * 60 * 60
 CHAT_RETENTION = timedelta(days=7)
+AUTH_VERIFY_LIMIT = 10
+AUTH_VERIFY_WINDOW = timedelta(minutes=10)
+CHAT_REQUEST_LIMIT = 10
+CHAT_REQUEST_WINDOW = timedelta(minutes=1)
+ANALYSIS_REQUEST_LIMIT = 5
+ANALYSIS_REQUEST_WINDOW = timedelta(minutes=10)
 
 
 def session_cookie_secure() -> bool:
     return os.getenv("SESSION_COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes"}
+
+
+async def enforce_rate_limit(
+    engine: AsyncEngine,
+    *,
+    scope: str,
+    subject: str,
+    limit: int,
+    window: timedelta,
+) -> None:
+    """Raise a user-safe HTTP 429 after an atomic persistent quota is exhausted."""
+    retry_after = await consume_api_rate_limit(
+        engine,
+        scope=scope,
+        subject=subject,
+        limit=limit,
+        window=window,
+    )
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="Забагато запитів. Спробуйте ще раз трохи пізніше.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def request_client_ip(request: Request) -> str:
+    """Return the direct peer address; reverse proxies must be explicitly trusted at deploy time."""
+    return request.client.host if request.client is not None else "unknown"
 
 
 def get_checkpoint_database_url() -> str:
@@ -260,6 +287,20 @@ async def verify_login(
 ) -> dict[str, object]:
     """Exchange a one-time Telegram bot code for an HttpOnly browser session."""
     engine: AsyncEngine = request.app.state.database_engine
+    await enforce_rate_limit(
+        engine,
+        scope="auth_verify_ip",
+        subject=request_client_ip(request),
+        limit=AUTH_VERIFY_LIMIT,
+        window=AUTH_VERIFY_WINDOW,
+    )
+    await enforce_rate_limit(
+        engine,
+        scope="auth_verify_telegram",
+        subject=str(credentials.telegram_id),
+        limit=AUTH_VERIFY_LIMIT,
+        window=AUTH_VERIFY_WINDOW,
+    )
     verified = await verify_web_login_code(engine, credentials.telegram_id, credentials.code)
     if not verified:
         raise HTTPException(status_code=401, detail="Код недійсний, прострочений або вже використаний.")
@@ -469,7 +510,88 @@ async def get_chat_thread(
     checkpointer: AsyncPostgresSaver = request.app.state.chat_checkpointer
     checkpoint = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
     messages = checkpoint.checkpoint["channel_values"].get("messages", []) if checkpoint else []
-    return {**thread, "messages": serialize_visible_messages(messages)}
+    pending_actions = await list_pending_ai_actions(
+        engine,
+        telegram_id=telegram_id,
+        project_id=project_id,
+        thread_id=thread_id,
+    )
+    return {
+        **thread,
+        "messages": serialize_visible_messages(messages),
+        "pending_actions": [pending_action_response(action) for action in pending_actions],
+    }
+
+
+@app.post("/api/ai/actions/{action_id}/confirm", response_model=ActionExecutionResponse)
+async def confirm_ai_action(
+    request: Request,
+    action_id: Annotated[str, Path(min_length=1, max_length=36)],
+    project_id: Annotated[int, Query(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> ActionExecutionResponse:
+    """Validate and execute one user-confirmed pending action exactly once."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    try:
+        action, created_transaction, replayed = await confirm_pending_create_transaction_action(
+            engine=engine,
+            telegram_id=telegram_id,
+            project_id=project_id,
+            action_id=action_id,
+        )
+    except Exception as error:
+        logger.exception("confirmed AI action %s failed", action_id)
+        raise HTTPException(status_code=500, detail="Не вдалося виконати підтверджену дію.") from error
+
+    if action is not None and action.get("status") == "failed":
+        raise HTTPException(status_code=422, detail="Чернетка дії не пройшла перевірку.")
+    if action is None or created_transaction is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Дію неможливо підтвердити: вона не існує, вже оброблена або прострочена.",
+        )
+    if replayed:
+        logger.info("idempotent AI action confirmation replayed for %s", action_id)
+    return ActionExecutionResponse(
+        action=pending_action_response(action),
+        transaction=TransactionResponse.model_validate(created_transaction),
+    )
+
+
+@app.post("/api/ai/actions/{action_id}/cancel", response_model=ActionExecutionResponse)
+async def cancel_ai_action(
+    request: Request,
+    action_id: Annotated[str, Path(min_length=1, max_length=36)],
+    project_id: Annotated[int, Query(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> ActionExecutionResponse:
+    """Cancel a pending action before it changes the financial ledger."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    action = await claim_pending_ai_action(
+        engine,
+        telegram_id=telegram_id,
+        project_id=project_id,
+        action_id=action_id,
+        target_status="cancelled",
+    )
+    if action is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Дію неможливо скасувати: вона не існує, вже оброблена або прострочена.",
+        )
+    await record_ai_action_audit(
+        engine,
+        user_id=int(action["user_id"]),
+        project_id=int(action["project_id"]),
+        thread_id=str(action["thread_id"]),
+        action_id=str(action["id"]),
+        action_type=str(action["action_type"]),
+        event="cancelled",
+        result={"status": "cancelled"},
+    )
+    return ActionExecutionResponse(action=pending_action_response(action))
 
 
 @app.post("/api/ai/chat")
@@ -481,13 +603,22 @@ async def chat_with_ai(
     """Stream one controlled Gemini reply while LangGraph persists the conversation."""
     engine: AsyncEngine = request.app.state.database_engine
     await require_user_project(engine, telegram_id, chat_request.project_id)
+    await enforce_rate_limit(
+        engine,
+        scope="ai_chat",
+        subject=f"{telegram_id}:{chat_request.project_id}",
+        limit=CHAT_REQUEST_LIMIT,
+        window=CHAT_REQUEST_WINDOW,
+    )
     await purge_expired_chat_threads(request)
 
     now = datetime.now(timezone.utc)
     expires_at = now + CHAT_RETENTION
     thread_id = chat_request.thread_id
+    thread: dict[str, object] | None = None
     if thread_id:
-        if await get_ai_chat_thread(engine, telegram_id, chat_request.project_id, thread_id) is None:
+        thread = await get_ai_chat_thread(engine, telegram_id, chat_request.project_id, thread_id)
+        if thread is None:
             raise HTTPException(status_code=404, detail="Діалог не знайдено або він уже прострочений.")
         renewed = await touch_ai_chat_thread(
             engine,
@@ -501,7 +632,7 @@ async def chat_with_ai(
     else:
         thread_id = str(uuid4())
         title = " ".join(chat_request.message.split())[:120]
-        await create_ai_chat_thread(
+        thread = await create_ai_chat_thread(
             engine,
             telegram_id,
             chat_request.project_id,
@@ -517,11 +648,36 @@ async def chat_with_ai(
         yield sse_event("thread", {"thread_id": thread_id})
         streamed_text = ""
         try:
+            conversation_summary = str(thread.get("memory_summary") or "") if thread else ""
+            summary_message_count = int(thread.get("summary_message_count") or 0) if thread else 0
+            checkpoint = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
+            previous_messages = checkpoint.checkpoint["channel_values"].get("messages", []) if checkpoint else []
+            try:
+                refreshed_summary, covered_message_count = await compact_chat_memory_if_needed(
+                    existing_summary=conversation_summary or None,
+                    summary_message_count=summary_message_count,
+                    visible_messages=serialize_visible_messages(previous_messages),
+                )
+                if refreshed_summary != (conversation_summary or None):
+                    saved = await save_ai_chat_memory_summary(
+                        engine,
+                        telegram_id=telegram_id,
+                        project_id=chat_request.project_id,
+                        thread_id=thread_id,
+                        summary=refreshed_summary or "",
+                        message_count=covered_message_count,
+                    )
+                    if saved:
+                        conversation_summary = refreshed_summary or ""
+            except Exception:
+                logger.exception("could not compact AI chat memory for thread %s", thread_id)
             graph = create_finance_chat_graph(
                 engine=engine,
                 telegram_id=telegram_id,
                 project_id=chat_request.project_id,
+                thread_id=thread_id,
                 checkpointer=checkpointer,
+                conversation_summary=conversation_summary or None,
             )
             config = {"configurable": {"thread_id": thread_id}}
             async for chunk, metadata in graph.astream(
@@ -544,6 +700,18 @@ async def chat_with_ai(
                     fallback_text = visible_messages[-1]["content"]
                     streamed_text = fallback_text
                     yield sse_event("delta", {"text": fallback_text})
+
+            pending_actions = await list_pending_ai_actions(
+                engine,
+                telegram_id=telegram_id,
+                project_id=chat_request.project_id,
+                thread_id=thread_id,
+            )
+            for action in pending_actions:
+                yield sse_event(
+                    "pending_action",
+                    {"action": pending_action_response(action).model_dump(mode="json")},
+                )
 
             touched = await touch_ai_chat_thread(
                 engine,
@@ -625,6 +793,13 @@ async def analyze_transactions(
         except (KeyError, ValidationError):
             logger.warning("ignoring invalid cached AI analysis for project %s", project_id)
 
+    await enforce_rate_limit(
+        engine,
+        scope="ai_analysis",
+        subject=f"{telegram_id}:{project_id}",
+        limit=ANALYSIS_REQUEST_LIMIT,
+        window=ANALYSIS_REQUEST_WINDOW,
+    )
     try:
         gemini_result = await asyncio.to_thread(
             analyze_prepared_transactions_with_gemini,
