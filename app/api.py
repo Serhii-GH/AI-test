@@ -18,6 +18,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.ai_actions import PendingActionResponse, TransactionActionPayload, pending_action_response
 from app.ai_chat import (
     FinanceChatError,
     create_finance_chat_graph,
@@ -30,6 +31,7 @@ from app.database import (
     create_user_project,
     create_web_session,
     create_database_engine,
+    claim_pending_ai_action,
     delete_ai_chat_threads,
     delete_web_session,
     get_ai_chat_thread,
@@ -41,12 +43,15 @@ from app.database import (
     get_web_session_telegram_id,
     initialize_database,
     list_expired_ai_chat_thread_ids,
+    list_pending_ai_actions,
     list_ai_chat_threads,
     list_user_projects,
     record_ai_analysis_metric,
+    record_ai_action_audit,
     save_cached_ai_analysis,
     delete_user_transaction,
     save_transaction,
+    finalize_pending_ai_action,
     touch_ai_chat_thread,
     verify_web_login_code,
 )
@@ -113,30 +118,8 @@ class CreateProjectRequest(BaseModel):
         return normalized_value
 
 
-class CreateTransactionRequest(BaseModel):
+class CreateTransactionRequest(TransactionActionPayload):
     project_id: Annotated[int, Field(gt=0)]
-    type: Literal["income", "expense"]
-    amount: Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)]
-    exchange_rate: Annotated[Decimal, Field(gt=0, max_digits=10, decimal_places=4)]
-    category: Literal["Роботи", "Матеріали"]
-    subcategory: Annotated[str, Field(min_length=1, max_length=100)]
-    description: Annotated[str, Field(min_length=1, max_length=255)]
-    date: date
-
-    @field_validator("amount", "exchange_rate")
-    @classmethod
-    def amount_must_be_a_positive_finite_number(cls, value: Decimal) -> Decimal:
-        if not value.is_finite() or value <= 0:
-            raise ValueError("amount must be a positive number")
-        return value
-
-    @field_validator("subcategory", "description")
-    @classmethod
-    def text_must_not_be_blank(cls, value: str) -> str:
-        normalized_value = value.strip()
-        if not normalized_value:
-            raise ValueError("value must not be blank")
-        return normalized_value
 
 
 class VerifyLoginRequest(BaseModel):
@@ -173,6 +156,12 @@ class ChatThreadResponse(BaseModel):
 
 class ChatHistoryResponse(ChatThreadResponse):
     messages: list[dict[str, str]]
+    pending_actions: list[PendingActionResponse]
+
+
+class ActionExecutionResponse(BaseModel):
+    action: PendingActionResponse
+    transaction: TransactionResponse | None = None
 
 
 SESSION_COOKIE_NAME = "admin_session"
@@ -469,7 +458,153 @@ async def get_chat_thread(
     checkpointer: AsyncPostgresSaver = request.app.state.chat_checkpointer
     checkpoint = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
     messages = checkpoint.checkpoint["channel_values"].get("messages", []) if checkpoint else []
-    return {**thread, "messages": serialize_visible_messages(messages)}
+    pending_actions = await list_pending_ai_actions(
+        engine,
+        telegram_id=telegram_id,
+        project_id=project_id,
+        thread_id=thread_id,
+    )
+    return {
+        **thread,
+        "messages": serialize_visible_messages(messages),
+        "pending_actions": [pending_action_response(action) for action in pending_actions],
+    }
+
+
+@app.post("/api/ai/actions/{action_id}/confirm", response_model=ActionExecutionResponse)
+async def confirm_ai_action(
+    request: Request,
+    action_id: Annotated[str, Path(min_length=1, max_length=36)],
+    project_id: Annotated[int, Query(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> ActionExecutionResponse:
+    """Validate and execute one user-confirmed pending action exactly once."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    action = await claim_pending_ai_action(
+        engine,
+        telegram_id=telegram_id,
+        project_id=project_id,
+        action_id=action_id,
+        target_status="processing",
+    )
+    if action is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Дію неможливо підтвердити: вона не існує, вже оброблена або прострочена.",
+        )
+
+    action_type = str(action["action_type"])
+    audit_context = {
+        "user_id": int(action["user_id"]),
+        "project_id": int(action["project_id"]),
+        "thread_id": str(action["thread_id"]),
+        "action_id": str(action["id"]),
+        "action_type": action_type,
+    }
+    await record_ai_action_audit(
+        engine,
+        **audit_context,
+        event="confirm_requested",
+        result={"status": "processing"},
+    )
+
+    if action_type != "create_transaction":
+        await finalize_pending_ai_action(engine, action_id=action_id, status="failed")
+        await record_ai_action_audit(
+            engine,
+            **audit_context,
+            event="failed",
+            result={"reason": "unsupported_action_type"},
+        )
+        raise HTTPException(status_code=422, detail="Тип дії не дозволений.")
+
+    try:
+        payload = TransactionActionPayload.model_validate(action["payload"])
+    except ValidationError as error:
+        await finalize_pending_ai_action(engine, action_id=action_id, status="failed")
+        await record_ai_action_audit(
+            engine,
+            **audit_context,
+            event="failed",
+            result={"reason": "invalid_payload"},
+        )
+        raise HTTPException(status_code=422, detail="Чернетка дії не пройшла перевірку.") from error
+
+    try:
+        created_transaction = await save_transaction(
+            engine=engine,
+            telegram_id=telegram_id,
+            username=None,
+            amount=payload.amount,
+            project_id=project_id,
+            exchange_rate=payload.exchange_rate,
+            main_category_name=payload.category,
+            subcategory_name=payload.subcategory,
+            description=payload.description,
+            transaction_type=payload.type,
+            created_at=datetime.combine(payload.date, time.min, tzinfo=timezone.utc),
+        )
+    except Exception as error:
+        logger.exception("confirmed AI action %s failed", action_id)
+        await finalize_pending_ai_action(engine, action_id=action_id, status="failed")
+        await record_ai_action_audit(
+            engine,
+            **audit_context,
+            event="failed",
+            result={"reason": "business_operation_failed"},
+        )
+        raise HTTPException(status_code=500, detail="Не вдалося виконати підтверджену дію.") from error
+
+    if not await finalize_pending_ai_action(engine, action_id=action_id, status="confirmed"):
+        logger.error("AI action %s created a transaction but was not finalized", action_id)
+        raise HTTPException(status_code=500, detail="Операцію створено, але її статус потребує перевірки.")
+    action["status"] = "confirmed"
+    await record_ai_action_audit(
+        engine,
+        **audit_context,
+        event="confirmed",
+        result={"transaction_id": int(created_transaction["id"])},
+    )
+    return ActionExecutionResponse(
+        action=pending_action_response(action),
+        transaction=TransactionResponse.model_validate(created_transaction),
+    )
+
+
+@app.post("/api/ai/actions/{action_id}/cancel", response_model=ActionExecutionResponse)
+async def cancel_ai_action(
+    request: Request,
+    action_id: Annotated[str, Path(min_length=1, max_length=36)],
+    project_id: Annotated[int, Query(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> ActionExecutionResponse:
+    """Cancel a pending action before it changes the financial ledger."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    action = await claim_pending_ai_action(
+        engine,
+        telegram_id=telegram_id,
+        project_id=project_id,
+        action_id=action_id,
+        target_status="cancelled",
+    )
+    if action is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Дію неможливо скасувати: вона не існує, вже оброблена або прострочена.",
+        )
+    await record_ai_action_audit(
+        engine,
+        user_id=int(action["user_id"]),
+        project_id=int(action["project_id"]),
+        thread_id=str(action["thread_id"]),
+        action_id=str(action["id"]),
+        action_type=str(action["action_type"]),
+        event="cancelled",
+        result={"status": "cancelled"},
+    )
+    return ActionExecutionResponse(action=pending_action_response(action))
 
 
 @app.post("/api/ai/chat")
@@ -521,6 +656,7 @@ async def chat_with_ai(
                 engine=engine,
                 telegram_id=telegram_id,
                 project_id=chat_request.project_id,
+                thread_id=thread_id,
                 checkpointer=checkpointer,
             )
             config = {"configurable": {"thread_id": thread_id}}
@@ -544,6 +680,18 @@ async def chat_with_ai(
                     fallback_text = visible_messages[-1]["content"]
                     streamed_text = fallback_text
                     yield sse_event("delta", {"text": fallback_text})
+
+            pending_actions = await list_pending_ai_actions(
+                engine,
+                telegram_id=telegram_id,
+                project_id=chat_request.project_id,
+                thread_id=thread_id,
+            )
+            for action in pending_actions:
+                yield sse_event(
+                    "pending_action",
+                    {"action": pending_action_response(action).model_dump(mode="json")},
+                )
 
             touched = await touch_ai_chat_thread(
                 engine,

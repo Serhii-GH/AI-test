@@ -3,9 +3,10 @@
 import json
 import os
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Annotated
+from typing import Any, Annotated, Literal
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
@@ -13,10 +14,15 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
-from pydantic import Field
+from pydantic import Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.database import get_transactions
+from app.ai_actions import (
+    ACTION_TYPE_CREATE_TRANSACTION,
+    TransactionActionPayload,
+    pending_action_response,
+)
+from app.database import create_pending_ai_action, get_transactions
 from app.prompts.ai_chat import build_finance_chat_system_prompt
 
 
@@ -24,6 +30,7 @@ DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 CHAT_MEMORY_MESSAGE_LIMIT = 16
 MAX_TOP_EXPENSES = 10
 MONEY_QUANTUM = Decimal("0.01")
+PENDING_ACTION_RETENTION = timedelta(hours=24)
 
 
 class FinanceChatError(RuntimeError):
@@ -65,6 +72,7 @@ def create_finance_chat_graph(
     engine: AsyncEngine,
     telegram_id: int,
     project_id: int,
+    thread_id: str,
     checkpointer: AsyncPostgresSaver,
 ) -> Any:
     """Create a project-scoped graph; the model never receives identity or DB access."""
@@ -183,7 +191,61 @@ def create_finance_chat_graph(
             }
         )
 
-    tools = [get_transactions_summary, get_category_totals, get_top_expenses]
+    @tool
+    async def propose_create_transaction(
+        transaction_type: Literal["income", "expense"],
+        amount: Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)],
+        exchange_rate: Annotated[Decimal, Field(gt=0, max_digits=10, decimal_places=4)],
+        category: Literal["Роботи", "Матеріали"],
+        subcategory: Annotated[str, Field(min_length=1, max_length=100)],
+        description: Annotated[str, Field(min_length=1, max_length=255)],
+        transaction_date: str,
+    ) -> str:
+        """Create a pending proposal to add exactly one finance operation.
+
+        This does NOT create a transaction. Call only after the user supplied every field:
+        income/expense type, positive UAH amount, USD exchange rate, one of the allowed
+        main categories «Роботи» or «Матеріали», subcategory, description and YYYY-MM-DD date.
+        The user must confirm the proposal in the interface before it changes the database.
+        """
+        try:
+            payload = TransactionActionPayload.model_validate(
+                {
+                    "type": transaction_type,
+                    "amount": amount,
+                    "exchange_rate": exchange_rate,
+                    "category": category,
+                    "subcategory": subcategory,
+                    "description": description,
+                    "date": transaction_date,
+                }
+            )
+        except ValidationError:
+            return _tool_error("Неможливо підготувати дію: перевірте всі обов'язкові поля операції.")
+
+        try:
+            action = await create_pending_ai_action(
+                engine,
+                telegram_id=telegram_id,
+                project_id=project_id,
+                thread_id=thread_id,
+                action_id=str(uuid4()),
+                action_type=ACTION_TYPE_CREATE_TRANSACTION,
+                payload=payload.model_dump(mode="json"),
+                payload_hash=payload.canonical_hash(),
+                expires_at=datetime.now(timezone.utc) + PENDING_ACTION_RETENTION,
+            )
+        except Exception:
+            return _tool_error("Не вдалося підготувати чернетку дії.")
+
+        return _json_payload(
+            {
+                "pending_action": pending_action_response(action).model_dump(mode="json"),
+                "confirmation_required": True,
+            }
+        )
+
+    tools = [get_transactions_summary, get_category_totals, get_top_expenses, propose_create_transaction]
     model = ChatGoogleGenerativeAI(
         model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
         google_api_key=api_key,

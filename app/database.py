@@ -166,6 +166,54 @@ ai_chat_threads = Table(
     Index("ix_ai_chat_threads_expiry", "expires_at"),
 )
 
+pending_ai_actions = Table(
+    "pending_ai_actions",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("user_id", BigInteger, ForeignKey("users.id"), nullable=False),
+    Column("project_id", BigInteger, ForeignKey("projects.id"), nullable=False),
+    Column("thread_id", String(36), nullable=False),
+    Column("action_type", String(50), nullable=False),
+    Column("payload", JSON, nullable=False),
+    Column("payload_hash", String(64), nullable=False),
+    Column("status", String(20), nullable=False, server_default="pending"),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("confirmed_at", DateTime(timezone=True)),
+    Column("cancelled_at", DateTime(timezone=True)),
+    CheckConstraint(
+        "status IN ('pending', 'processing', 'confirmed', 'cancelled', 'failed')",
+        name="ck_pending_ai_actions_status",
+    ),
+    Index("ix_pending_ai_actions_project_status", "project_id", "status", "created_at"),
+    Index("ix_pending_ai_actions_thread_status", "thread_id", "status"),
+    Index(
+        "uq_pending_ai_actions_active_payload",
+        "thread_id",
+        "action_type",
+        "payload_hash",
+        unique=True,
+        postgresql_where=text("status = 'pending'"),
+    ),
+)
+
+ai_action_audit_log = Table(
+    "ai_action_audit_log",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("user_id", BigInteger, ForeignKey("users.id"), nullable=False),
+    Column("project_id", BigInteger, ForeignKey("projects.id"), nullable=False),
+    Column("thread_id", String(36), nullable=False),
+    Column("action_id", String(36), ForeignKey("pending_ai_actions.id"), nullable=False),
+    Column("action_type", String(50), nullable=False),
+    Column("event", String(30), nullable=False),
+    Column("result", JSON, nullable=False, server_default=text("'{}'::json")),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Index("ix_ai_action_audit_log_project_created", "project_id", "created_at"),
+    Index("ix_ai_action_audit_log_action", "action_id", "created_at"),
+)
+
 
 def get_database_url() -> URL:
     """Read DATABASE_URL and adapt a standard PostgreSQL URL for asyncpg."""
@@ -873,6 +921,222 @@ async def delete_ai_chat_threads(engine: AsyncEngine, thread_ids: list[str]) -> 
         return
     async with engine.begin() as connection:
         await connection.execute(delete(ai_chat_threads).where(ai_chat_threads.c.id.in_(thread_ids)))
+
+
+async def create_pending_ai_action(
+    engine: AsyncEngine,
+    *,
+    telegram_id: int,
+    project_id: int,
+    thread_id: str,
+    action_id: str,
+    action_type: str,
+    payload: dict[str, object],
+    payload_hash: str,
+    expires_at: datetime,
+) -> dict[str, object]:
+    """Persist an AI proposal only; this function never changes financial data."""
+    async with engine.begin() as connection:
+        user_id = await connection.scalar(select(users.c.id).where(users.c.telegram_id == telegram_id))
+        if user_id is None:
+            raise RuntimeError("Cannot create a pending action for an unknown user.")
+
+        # The partial unique index covers every pending row, including an expired
+        # one. Retire a matching expired proposal before inserting a fresh one.
+        # That keeps a user from being permanently blocked after the 24-hour TTL.
+        now = datetime.now(timezone.utc)
+        await connection.execute(
+            update(pending_ai_actions)
+            .where(
+                pending_ai_actions.c.user_id == user_id,
+                pending_ai_actions.c.project_id == project_id,
+                pending_ai_actions.c.thread_id == thread_id,
+                pending_ai_actions.c.action_type == action_type,
+                pending_ai_actions.c.payload_hash == payload_hash,
+                pending_ai_actions.c.status == "pending",
+                pending_ai_actions.c.expires_at <= now,
+            )
+            .values(status="failed", updated_at=now)
+        )
+
+        existing = await connection.execute(
+            select(pending_ai_actions)
+            .where(
+                pending_ai_actions.c.user_id == user_id,
+                pending_ai_actions.c.project_id == project_id,
+                pending_ai_actions.c.thread_id == thread_id,
+                pending_ai_actions.c.action_type == action_type,
+                pending_ai_actions.c.payload_hash == payload_hash,
+                pending_ai_actions.c.status == "pending",
+                pending_ai_actions.c.expires_at > now,
+            )
+            .limit(1)
+        )
+        existing_action = existing.mappings().one_or_none()
+        if existing_action is not None:
+            return dict(existing_action)
+
+        result = await connection.execute(
+            insert(pending_ai_actions)
+            .values(
+                id=action_id,
+                user_id=user_id,
+                project_id=project_id,
+                thread_id=thread_id,
+                action_type=action_type,
+                payload=payload,
+                payload_hash=payload_hash,
+                expires_at=expires_at,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    pending_ai_actions.c.thread_id,
+                    pending_ai_actions.c.action_type,
+                    pending_ai_actions.c.payload_hash,
+                ],
+                index_where=text("status = 'pending'"),
+            )
+            .returning(pending_ai_actions)
+        )
+        inserted_action = result.mappings().one_or_none()
+        if inserted_action is None:
+            existing = await connection.execute(
+                select(pending_ai_actions)
+                .where(
+                    pending_ai_actions.c.user_id == user_id,
+                    pending_ai_actions.c.project_id == project_id,
+                    pending_ai_actions.c.thread_id == thread_id,
+                    pending_ai_actions.c.action_type == action_type,
+                    pending_ai_actions.c.payload_hash == payload_hash,
+                    pending_ai_actions.c.status == "pending",
+                    pending_ai_actions.c.expires_at > now,
+                )
+                .limit(1)
+            )
+            existing_action = existing.mappings().one_or_none()
+            if existing_action is None:
+                raise RuntimeError("Could not create or retrieve the pending action.")
+            return dict(existing_action)
+
+        action = dict(inserted_action)
+        await connection.execute(
+            insert(ai_action_audit_log).values(
+                user_id=user_id,
+                project_id=project_id,
+                thread_id=thread_id,
+                action_id=action_id,
+                action_type=action_type,
+                event="pending_created",
+                result={"status": "pending"},
+            )
+        )
+        return action
+
+
+async def list_pending_ai_actions(
+    engine: AsyncEngine,
+    *,
+    telegram_id: int,
+    project_id: int,
+    thread_id: str,
+) -> list[dict[str, object]]:
+    """Return only active proposals visible to the action's owner."""
+    statement = (
+        select(pending_ai_actions)
+        .select_from(pending_ai_actions.join(users))
+        .where(
+            users.c.telegram_id == telegram_id,
+            pending_ai_actions.c.project_id == project_id,
+            pending_ai_actions.c.thread_id == thread_id,
+            pending_ai_actions.c.status == "pending",
+            pending_ai_actions.c.expires_at > datetime.now(timezone.utc),
+        )
+        .order_by(pending_ai_actions.c.created_at)
+    )
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        return [dict(row) for row in result.mappings().all()]
+
+
+async def claim_pending_ai_action(
+    engine: AsyncEngine,
+    *,
+    telegram_id: int,
+    project_id: int,
+    action_id: str,
+    target_status: str,
+) -> dict[str, object] | None:
+    """Atomically move one unexpired pending action to processing or cancelled."""
+    if target_status not in {"processing", "cancelled"}:
+        raise ValueError("Invalid pending action target status.")
+    now = datetime.now(timezone.utc)
+    values: dict[str, object] = {"status": target_status, "updated_at": now}
+    if target_status == "cancelled":
+        values["cancelled_at"] = now
+
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            update(pending_ai_actions)
+            .where(
+                pending_ai_actions.c.id == action_id,
+                pending_ai_actions.c.project_id == project_id,
+                pending_ai_actions.c.user_id
+                == select(users.c.id).where(users.c.telegram_id == telegram_id).scalar_subquery(),
+                pending_ai_actions.c.status == "pending",
+                pending_ai_actions.c.expires_at > now,
+            )
+            .values(**values)
+            .returning(pending_ai_actions)
+        )
+        action = result.mappings().one_or_none()
+        return dict(action) if action is not None else None
+
+
+async def finalize_pending_ai_action(
+    engine: AsyncEngine,
+    *,
+    action_id: str,
+    status: str,
+) -> bool:
+    """Finish an already claimed action after business validation and execution."""
+    if status not in {"confirmed", "failed"}:
+        raise ValueError("Invalid final pending action status.")
+    values: dict[str, object] = {"status": status, "updated_at": datetime.now(timezone.utc)}
+    if status == "confirmed":
+        values["confirmed_at"] = datetime.now(timezone.utc)
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            update(pending_ai_actions)
+            .where(pending_ai_actions.c.id == action_id, pending_ai_actions.c.status == "processing")
+            .values(**values)
+        )
+        return result.rowcount == 1
+
+
+async def record_ai_action_audit(
+    engine: AsyncEngine,
+    *,
+    user_id: int,
+    project_id: int,
+    thread_id: str,
+    action_id: str,
+    action_type: str,
+    event: str,
+    result: dict[str, object],
+) -> None:
+    """Write an immutable, secret-free record of a controlled AI action event."""
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(ai_action_audit_log).values(
+                user_id=user_id,
+                project_id=project_id,
+                thread_id=thread_id,
+                action_id=action_id,
+                action_type=action_type,
+                event=event,
+                result=result,
+            )
+        )
 
 
 async def get_cached_ai_analysis(
