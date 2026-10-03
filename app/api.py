@@ -1,15 +1,17 @@
 import asyncio
+import logging
 from io import BytesIO
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 import os
+from time import perf_counter
 from typing import Annotated, Literal
 
 from aiogram import Bot
 from dotenv import load_dotenv
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Path, Query, Request, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.database import (
@@ -19,21 +21,33 @@ from app.database import (
     create_database_engine,
     delete_web_session,
     get_financial_summary,
+    get_cached_ai_analysis,
     get_telegram_user_profile,
     get_transactions,
     get_user_project,
     get_web_session_telegram_id,
     initialize_database,
     list_user_projects,
+    record_ai_analysis_metric,
+    save_cached_ai_analysis,
     delete_user_transaction,
     save_transaction,
     verify_web_login_code,
 )
 from app.gemini_analysis import (
     GeminiAnalysisError,
+    GeminiTransactionAnalysis,
     TransactionAnalysisResponse,
-    analyze_transactions_with_gemini,
+    analyze_prepared_transactions_with_gemini,
+    build_dashboard_analysis,
+    estimate_prepared_analysis_tokens,
+    insufficient_data_analysis,
+    prepare_transaction_analysis,
 )
+from app.prompts.transaction_analysis import PROMPT_VERSION
+
+
+logger = logging.getLogger(__name__)
 
 
 class TransactionResponse(BaseModel):
@@ -55,6 +69,14 @@ class FinancialSummaryResponse(BaseModel):
     total_income: Decimal
     total_expense: Decimal
     balance: Decimal
+
+
+class TokenEstimateResponse(BaseModel):
+    input_tokens: int = Field(ge=0)
+    output_token_budget: int = Field(ge=0)
+    potential_total_tokens: int = Field(ge=0)
+    tokenizer: str
+    note: str
 
 
 class ProjectResponse(BaseModel):
@@ -320,19 +342,106 @@ async def get_summary(
     return await get_financial_summary(engine, telegram_id, project_id)
 
 
+@app.get("/api/ai/token-estimate", response_model=TokenEstimateResponse)
+async def estimate_ai_tokens(
+    request: Request,
+    project_id: Annotated[int, Query(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> TokenEstimateResponse:
+    """Estimate the next analysis request locally without calling Gemini."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    transactions = await get_transactions(engine, telegram_id, project_id)
+    estimate = estimate_prepared_analysis_tokens(prepare_transaction_analysis(transactions))
+    return TokenEstimateResponse(
+        input_tokens=estimate.input_tokens,
+        output_token_budget=estimate.output_token_budget,
+        potential_total_tokens=estimate.potential_total_tokens,
+        tokenizer=estimate.tokenizer,
+        note="Оцінка tiktoken; фактичні токени Gemini можуть відрізнятися.",
+    )
+
+
 @app.post("/api/ai/analyze-transactions", response_model=TransactionAnalysisResponse)
 async def analyze_transactions(
     request: Request,
     project_id: Annotated[int, Query(gt=0)],
     telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
 ) -> TransactionAnalysisResponse:
-    """Analyze the authenticated user's Neon transactions with Gemini on the backend."""
+    """Analyze compact project facts with Gemini, reusing a matching cached result."""
     engine: AsyncEngine = request.app.state.database_engine
     await require_user_project(engine, telegram_id, project_id)
     transactions = await get_transactions(engine, telegram_id, project_id)
+    prepared = prepare_transaction_analysis(transactions)
+    started_at = perf_counter()
+
+    async def record_metric(**values: object) -> None:
+        try:
+            await record_ai_analysis_metric(
+                engine,
+                project_id=project_id,
+                ledger_hash=prepared.ledger_hash,
+                prompt_version=PROMPT_VERSION,
+                latency_ms=round((perf_counter() - started_at) * 1000),
+                **values,
+            )
+        except Exception:
+            logger.exception("could not record AI analysis metric")
+
+    if not prepared.is_sufficient:
+        response = build_dashboard_analysis(insufficient_data_analysis(), prepared).model_copy(
+            update={"generated_at": datetime.now(timezone.utc)}
+        )
+        await record_metric(result_source="fallback", status="success")
+        return response
+
+    cached_analysis = await get_cached_ai_analysis(
+        engine,
+        project_id,
+        prepared.ledger_hash,
+        PROMPT_VERSION,
+    )
+    if cached_analysis is not None:
+        try:
+            narrative = GeminiTransactionAnalysis.model_validate(cached_analysis["analysis"])
+            response = build_dashboard_analysis(narrative, prepared).model_copy(
+                update={"cached": True, "generated_at": cached_analysis["created_at"]}
+            )
+            await record_metric(result_source="cache", status="success")
+            return response
+        except (KeyError, ValidationError):
+            logger.warning("ignoring invalid cached AI analysis for project %s", project_id)
+
     try:
-        return await asyncio.to_thread(analyze_transactions_with_gemini, transactions)
+        gemini_result = await asyncio.to_thread(
+            analyze_prepared_transactions_with_gemini,
+            prepared,
+        )
+        response = build_dashboard_analysis(gemini_result.analysis, prepared).model_copy(
+            update={"generated_at": datetime.now(timezone.utc)}
+        )
+        try:
+            await save_cached_ai_analysis(
+                engine,
+                project_id,
+                prepared.ledger_hash,
+                PROMPT_VERSION,
+                gemini_result.analysis.model_dump(mode="json"),
+            )
+        except Exception:
+            logger.exception("could not cache AI analysis")
+        await record_metric(
+            result_source="gemini",
+            status="success",
+            model=gemini_result.model,
+            input_tokens=gemini_result.usage.input_tokens,
+            output_tokens=gemini_result.usage.output_tokens,
+            thought_tokens=gemini_result.usage.thought_tokens,
+            cached_tokens=gemini_result.usage.cached_tokens,
+        )
+        return response
     except GeminiAnalysisError as error:
+        await record_metric(result_source="gemini", status="error")
         if not os.getenv("GEMINI_API_KEY"):
             raise HTTPException(status_code=503, detail="AI-аналіз тимчасово недоступний.") from error
         raise HTTPException(status_code=502, detail="Не вдалося отримати коректний AI-аналіз. Спробуйте ще раз.") from error
