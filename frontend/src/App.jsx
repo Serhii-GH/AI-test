@@ -48,6 +48,10 @@ function formatUsd(value) {
   return usdFormatter.format(Number(value ?? 0))
 }
 
+function formatExchangeRate(value) {
+  return Number(value ?? 0).toFixed(2)
+}
+
 function formatDate(value) {
   return value ? dateFormatter.format(new Date(value)) : '—'
 }
@@ -927,7 +931,7 @@ function App() {
                       <div><dt>Сума</dt><dd>{formatCurrency(action.payload.amount)}</dd></div>
                       <div><dt>Категорія</dt><dd>{action.payload.category} → {action.payload.subcategory}</dd></div>
                       <div><dt>Дата</dt><dd>{formatDate(action.payload.date)}</dd></div>
-                      <div><dt>Курс USD</dt><dd>{Number(action.payload.exchange_rate).toLocaleString('uk-UA')}</dd></div>
+                      <div><dt>Курс USD</dt><dd>{formatExchangeRate(action.payload.exchange_rate)} грн/$</dd></div>
                       <div className="pending-action-description"><dt>Опис</dt><dd>{action.payload.description}</dd></div>
                     </dl>
                     <div className="pending-action-buttons">
@@ -1189,7 +1193,7 @@ function App() {
                             <td className={isIncome ? 'table-amount usd-amount income-amount' : 'table-amount usd-amount'}>
                               {transaction.amount_usd == null ? '—' : <>
                                 {isIncome ? '+' : '−'}{formatUsd(transaction.amount_usd)}
-                                <small>Курс: {Number(transaction.exchange_rate).toFixed(4)} грн/$</small>
+                                <small>Курс: {formatExchangeRate(transaction.exchange_rate)} грн/$</small>
                               </>}
                             </td>
                             <td className="transaction-action-cell">

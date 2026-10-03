@@ -193,6 +193,9 @@ React AI Chat → POST /api/ai/chat (SSE) → LangGraph → read-only tool аб�
 
 Після зміни chat prompt збільште `CHAT_PROMPT_VERSION`, оновіть `tests/test_ai_chat.py` і перевірте streaming у Docker. Контракт action tool, статуси та API описані в `AI_ACTIONS_NOTES.md`.
 
+- Після накопичення старих повідомлень backend стисло підсумовує їх у `memory_summary` діалогу. Gemini отримує цей summary і останні 10 видимих повідомлень, а не просто втрачає ранній контекст.
+- Ліміти: chat — 10 запитів/хвилину на користувача та проєкт; реальний виклик AI-аналізу — 5/10 хвилин; перевірка входу — 10/10 хвилин на IP і Telegram ID. Кешований AI-аналіз не витрачає AI-ліміт.
+
 ## Чого не робити
 
 - Не обчислювати суми у відповіді Gemini.

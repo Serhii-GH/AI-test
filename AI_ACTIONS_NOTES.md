@@ -40,6 +40,14 @@ Tool `propose_create_transaction` створює лише чернетку. Ві
 Перехід із `pending` атомарний. Отже, другий клік confirm або cancel не може виконати
 операцію двічі. Однаковий активний payload у межах thread не створює додаткову чернетку.
 
+## Атомарний confirm
+
+Під час confirm backend блокує pending action, повторно валідовує payload, створює транзакцію,
+змінює status action на `confirmed` і додає audit-записи в одній транзакції БД.
+
+`transactions.source_action_id` зберігає `action_id` і є унікальним для непорожніх значень.
+Повторний confirm не створює дубль, а повертає вже створену транзакцію.
+
 ## API
 
 - `POST /api/ai/chat` — у SSE може надійти `pending_action` з даними картки.
