@@ -1,25 +1,38 @@
 import asyncio
+import json
 import logging
 from io import BytesIO
 from contextlib import asynccontextmanager
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import os
 from time import perf_counter
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from aiogram import Bot
 from dotenv import load_dotenv
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Path, Query, Request, Response
+from fastapi.responses import StreamingResponse
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.ai_chat import (
+    FinanceChatError,
+    create_finance_chat_graph,
+    message_content_to_text,
+    serialize_visible_messages,
+)
 from app.database import (
     check_database_connection,
+    create_ai_chat_thread,
     create_user_project,
     create_web_session,
     create_database_engine,
+    delete_ai_chat_threads,
     delete_web_session,
+    get_ai_chat_thread,
     get_financial_summary,
     get_cached_ai_analysis,
     get_telegram_user_profile,
@@ -27,11 +40,14 @@ from app.database import (
     get_user_project,
     get_web_session_telegram_id,
     initialize_database,
+    list_expired_ai_chat_thread_ids,
+    list_ai_chat_threads,
     list_user_projects,
     record_ai_analysis_metric,
     save_cached_ai_analysis,
     delete_user_transaction,
     save_transaction,
+    touch_ai_chat_thread,
     verify_web_login_code,
 )
 from app.gemini_analysis import (
@@ -133,12 +149,47 @@ class SessionResponse(BaseModel):
     username: str | None
 
 
+class ChatRequest(BaseModel):
+    message: Annotated[str, Field(min_length=1, max_length=2_000)]
+    project_id: Annotated[int, Field(gt=0)]
+    thread_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+    @field_validator("message")
+    @classmethod
+    def message_must_not_be_blank(cls, value: str) -> str:
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("message must not be blank")
+        return normalized_value
+
+
+class ChatThreadResponse(BaseModel):
+    id: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime
+
+
+class ChatHistoryResponse(ChatThreadResponse):
+    messages: list[dict[str, str]]
+
+
 SESSION_COOKIE_NAME = "admin_session"
 SESSION_DURATION_SECONDS = 7 * 24 * 60 * 60
+CHAT_RETENTION = timedelta(days=7)
 
 
 def session_cookie_secure() -> bool:
     return os.getenv("SESSION_COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def get_checkpoint_database_url() -> str:
+    """Keep PostgreSQL's libpq URL intact for psycopg/LangGraph."""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is not configured.")
+    return database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 
 @asynccontextmanager
@@ -149,7 +200,13 @@ async def lifespan(app: FastAPI):
     await initialize_database(engine)
     app.state.database_engine = engine
     try:
-        yield
+        async with AsyncPostgresSaver.from_conn_string(get_checkpoint_database_url()) as checkpointer:
+            await checkpointer.setup()
+            app.state.chat_checkpointer = checkpointer
+            try:
+                yield
+            finally:
+                del app.state.chat_checkpointer
     finally:
         await engine.dispose()
 
@@ -174,6 +231,25 @@ async def require_authenticated_telegram_id(
 async def require_user_project(engine: AsyncEngine, telegram_id: int, project_id: int) -> None:
     if await get_user_project(engine, telegram_id, project_id) is None:
         raise HTTPException(status_code=404, detail="Проєкт не знайдено.")
+
+
+async def purge_expired_chat_threads(request: Request) -> None:
+    """Remove expired metadata and the matching LangGraph checkpoints together."""
+    engine: AsyncEngine = request.app.state.database_engine
+    expired_thread_ids = await list_expired_ai_chat_thread_ids(engine)
+    checkpointer: AsyncPostgresSaver = request.app.state.chat_checkpointer
+    deleted_thread_ids: list[str] = []
+    for thread_id in expired_thread_ids:
+        try:
+            await checkpointer.adelete_thread(thread_id)
+            deleted_thread_ids.append(thread_id)
+        except Exception:
+            logger.exception("could not delete expired AI chat checkpoint %s", thread_id)
+    await delete_ai_chat_threads(engine, deleted_thread_ids)
+
+
+def sse_event(event: str, payload: dict[str, object]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 @app.post("/api/auth/verify", response_model=SessionResponse)
@@ -359,6 +435,143 @@ async def estimate_ai_tokens(
         potential_total_tokens=estimate.potential_total_tokens,
         tokenizer=estimate.tokenizer,
         note="Оцінка tiktoken; фактичні токени Gemini можуть відрізнятися.",
+    )
+
+
+@app.get("/api/ai/chat/threads", response_model=list[ChatThreadResponse])
+async def list_chat_threads(
+    request: Request,
+    project_id: Annotated[int, Query(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> list[dict[str, object]]:
+    """List the current project's non-expired short-term conversations."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    await purge_expired_chat_threads(request)
+    return await list_ai_chat_threads(engine, telegram_id, project_id)
+
+
+@app.get("/api/ai/chat/threads/{thread_id}", response_model=ChatHistoryResponse)
+async def get_chat_thread(
+    request: Request,
+    thread_id: Annotated[str, Path(min_length=1, max_length=36)],
+    project_id: Annotated[int, Query(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> dict[str, object]:
+    """Return visible short-term history after enforcing project ownership."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    await purge_expired_chat_threads(request)
+    thread = await get_ai_chat_thread(engine, telegram_id, project_id, thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Діалог не знайдено або він уже прострочений.")
+
+    checkpointer: AsyncPostgresSaver = request.app.state.chat_checkpointer
+    checkpoint = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
+    messages = checkpoint.checkpoint["channel_values"].get("messages", []) if checkpoint else []
+    return {**thread, "messages": serialize_visible_messages(messages)}
+
+
+@app.post("/api/ai/chat")
+async def chat_with_ai(
+    request: Request,
+    chat_request: ChatRequest,
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> StreamingResponse:
+    """Stream one controlled Gemini reply while LangGraph persists the conversation."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, chat_request.project_id)
+    await purge_expired_chat_threads(request)
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + CHAT_RETENTION
+    thread_id = chat_request.thread_id
+    if thread_id:
+        if await get_ai_chat_thread(engine, telegram_id, chat_request.project_id, thread_id) is None:
+            raise HTTPException(status_code=404, detail="Діалог не знайдено або він уже прострочений.")
+        renewed = await touch_ai_chat_thread(
+            engine,
+            telegram_id,
+            chat_request.project_id,
+            thread_id,
+            expires_at,
+        )
+        if not renewed:
+            raise HTTPException(status_code=404, detail="Діалог не знайдено або він уже прострочений.")
+    else:
+        thread_id = str(uuid4())
+        title = " ".join(chat_request.message.split())[:120]
+        await create_ai_chat_thread(
+            engine,
+            telegram_id,
+            chat_request.project_id,
+            thread_id,
+            title or "Новий діалог",
+            expires_at,
+        )
+
+    checkpointer: AsyncPostgresSaver = request.app.state.chat_checkpointer
+
+    async def generate_events():
+        assert thread_id is not None
+        yield sse_event("thread", {"thread_id": thread_id})
+        streamed_text = ""
+        try:
+            graph = create_finance_chat_graph(
+                engine=engine,
+                telegram_id=telegram_id,
+                project_id=chat_request.project_id,
+                checkpointer=checkpointer,
+            )
+            config = {"configurable": {"thread_id": thread_id}}
+            async for chunk, metadata in graph.astream(
+                {"messages": [("user", chat_request.message)]},
+                config,
+                stream_mode="messages",
+            ):
+                if metadata.get("langgraph_node") != "assistant":
+                    continue
+                text_chunk = message_content_to_text(chunk.content)
+                if text_chunk:
+                    streamed_text += text_chunk
+                    yield sse_event("delta", {"text": text_chunk})
+
+            if not streamed_text:
+                state = await graph.aget_state(config)
+                messages = state.values.get("messages", [])
+                visible_messages = serialize_visible_messages(messages)
+                if visible_messages and visible_messages[-1]["role"] == "assistant":
+                    fallback_text = visible_messages[-1]["content"]
+                    streamed_text = fallback_text
+                    yield sse_event("delta", {"text": fallback_text})
+
+            touched = await touch_ai_chat_thread(
+                engine,
+                telegram_id,
+                chat_request.project_id,
+                thread_id,
+                datetime.now(timezone.utc) + CHAT_RETENTION,
+            )
+            if not touched:
+                raise FinanceChatError("AI chat thread expired during response generation.")
+            yield sse_event("done", {"thread_id": thread_id, "answer": streamed_text})
+        except FinanceChatError:
+            yield sse_event("error", {"message": "AI-помічник тимчасово недоступний. Спробуйте ще раз."})
+        except Exception as error:
+            logger.exception("AI chat request failed for project %s", chat_request.project_id)
+            error_text = str(error)
+            if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
+                yield sse_event(
+                    "error",
+                    {"message": "Gemini тимчасово досяг ліміту запитів. Зачекайте близько хвилини та спробуйте ще раз."},
+                )
+            else:
+                yield sse_event("error", {"message": "Не вдалося сформувати відповідь AI-помічника. Спробуйте ще раз."})
+
+    return StreamingResponse(
+        generate_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

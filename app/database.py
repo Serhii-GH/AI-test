@@ -1,7 +1,7 @@
 import os
 import hashlib
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 from sqlalchemy import (
@@ -150,6 +150,20 @@ ai_analysis_metrics = Table(
     Column("latency_ms", Integer),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Index("ix_ai_analysis_metrics_project_created", "project_id", "created_at"),
+)
+
+ai_chat_threads = Table(
+    "ai_chat_threads",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("user_id", BigInteger, ForeignKey("users.id"), nullable=False),
+    Column("project_id", BigInteger, ForeignKey("projects.id"), nullable=False),
+    Column("title", String(120), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Index("ix_ai_chat_threads_project_updated", "project_id", "updated_at"),
+    Index("ix_ai_chat_threads_expiry", "expires_at"),
 )
 
 
@@ -681,6 +695,8 @@ async def get_transactions(
     engine: AsyncEngine,
     telegram_id: int,
     project_id: int,
+    start_date: date | None = None,
+    end_date: date | None = None,
 ) -> list[dict[str, object]]:
     """Return one project's transactions, newest first, with category hierarchy."""
     main_categories = categories.alias("main_categories")
@@ -712,9 +728,151 @@ async def get_transactions(
         .order_by(desc(transactions.c.created_at), desc(transactions.c.id))
     )
 
+    if start_date is not None:
+        statement = statement.where(
+            transactions.c.created_at >= datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
+        )
+    if end_date is not None:
+        statement = statement.where(
+            transactions.c.created_at < datetime.combine(
+                end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
+            )
+        )
+
     async with engine.connect() as connection:
         result = await connection.execute(statement)
         return [dict(row) for row in result.mappings().all()]
+
+
+async def create_ai_chat_thread(
+    engine: AsyncEngine,
+    telegram_id: int,
+    project_id: int,
+    thread_id: str,
+    title: str,
+    expires_at: datetime,
+) -> dict[str, object]:
+    """Store only the ownership and lifecycle metadata for one AI chat."""
+    async with engine.begin() as connection:
+        user_id = await connection.scalar(
+            select(users.c.id).where(users.c.telegram_id == telegram_id)
+        )
+        if user_id is None:
+            raise RuntimeError("Cannot create an AI chat for an unknown user.")
+        result = await connection.execute(
+            insert(ai_chat_threads)
+            .values(
+                id=thread_id,
+                user_id=user_id,
+                project_id=project_id,
+                title=title,
+                expires_at=expires_at,
+            )
+            .returning(
+                ai_chat_threads.c.id,
+                ai_chat_threads.c.title,
+                ai_chat_threads.c.created_at,
+                ai_chat_threads.c.updated_at,
+                ai_chat_threads.c.expires_at,
+            )
+        )
+        return dict(result.mappings().one())
+
+
+async def get_ai_chat_thread(
+    engine: AsyncEngine,
+    telegram_id: int,
+    project_id: int,
+    thread_id: str,
+) -> dict[str, object] | None:
+    """Return a non-expired chat only when it belongs to this user and project."""
+    statement = (
+        select(
+            ai_chat_threads.c.id,
+            ai_chat_threads.c.title,
+            ai_chat_threads.c.created_at,
+            ai_chat_threads.c.updated_at,
+            ai_chat_threads.c.expires_at,
+        )
+        .select_from(ai_chat_threads.join(users))
+        .where(
+            users.c.telegram_id == telegram_id,
+            ai_chat_threads.c.project_id == project_id,
+            ai_chat_threads.c.id == thread_id,
+            ai_chat_threads.c.expires_at > datetime.now(timezone.utc),
+        )
+    )
+    async with engine.connect() as connection:
+        row = (await connection.execute(statement)).mappings().one_or_none()
+        return dict(row) if row is not None else None
+
+
+async def list_ai_chat_threads(
+    engine: AsyncEngine,
+    telegram_id: int,
+    project_id: int,
+) -> list[dict[str, object]]:
+    """List active chats; message contents stay in the LangGraph checkpoint."""
+    statement = (
+        select(
+            ai_chat_threads.c.id,
+            ai_chat_threads.c.title,
+            ai_chat_threads.c.created_at,
+            ai_chat_threads.c.updated_at,
+            ai_chat_threads.c.expires_at,
+        )
+        .select_from(ai_chat_threads.join(users))
+        .where(
+            users.c.telegram_id == telegram_id,
+            ai_chat_threads.c.project_id == project_id,
+            ai_chat_threads.c.expires_at > datetime.now(timezone.utc),
+        )
+        .order_by(desc(ai_chat_threads.c.updated_at), desc(ai_chat_threads.c.created_at))
+    )
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        return [dict(row) for row in result.mappings().all()]
+
+
+async def touch_ai_chat_thread(
+    engine: AsyncEngine,
+    telegram_id: int,
+    project_id: int,
+    thread_id: str,
+    expires_at: datetime,
+) -> bool:
+    """Renew the seven-day retention window for an owned active chat."""
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            update(ai_chat_threads)
+            .where(
+                ai_chat_threads.c.id == thread_id,
+                ai_chat_threads.c.project_id == project_id,
+                ai_chat_threads.c.user_id
+                == select(users.c.id).where(users.c.telegram_id == telegram_id).scalar_subquery(),
+                ai_chat_threads.c.expires_at > datetime.now(timezone.utc),
+            )
+            .values(updated_at=datetime.now(timezone.utc), expires_at=expires_at)
+        )
+        return result.rowcount == 1
+
+
+async def list_expired_ai_chat_thread_ids(engine: AsyncEngine) -> list[str]:
+    """Return expired checkpoint IDs before deleting their metadata."""
+    now = datetime.now(timezone.utc)
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            select(ai_chat_threads.c.id).where(ai_chat_threads.c.expires_at <= now)
+        )
+        return [str(thread_id) for thread_id in result.scalars().all()]
+
+
+async def delete_ai_chat_threads(engine: AsyncEngine, thread_ids: list[str]) -> None:
+    """Remove metadata only after the related checkpoints were cleared."""
+    if not thread_ids:
+        return
+    async with engine.begin() as connection:
+        await connection.execute(delete(ai_chat_threads).where(ai_chat_threads.c.id.in_(thread_ids)))
 
 
 async def get_cached_ai_analysis(
