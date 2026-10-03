@@ -108,6 +108,32 @@ function ExpenseDistributionChart({ title, description, totals, isLoading, empty
   )
 }
 
+function consumeSseEvents(buffer, onEvent) {
+  let remainder = buffer
+  let boundary = remainder.search(/\r?\n\r?\n/)
+
+  while (boundary !== -1) {
+    const block = remainder.slice(0, boundary)
+    remainder = remainder.slice(boundary).replace(/^\r?\n\r?\n/, '')
+    const event = block.match(/^event:\s*(.+)$/m)?.[1]?.trim()
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trimStart())
+      .join('\n')
+    if (event && data) {
+      try {
+        onEvent(event, JSON.parse(data))
+      } catch {
+        // A malformed event is ignored; the following error/done event remains usable.
+      }
+    }
+    boundary = remainder.search(/\r?\n\r?\n/)
+  }
+
+  return remainder
+}
+
 function App() {
   const [telegramId, setTelegramId] = useState(null)
   const [telegramUsername, setTelegramUsername] = useState(null)
@@ -135,6 +161,12 @@ function App() {
   const [analysis, setAnalysis] = useState(null)
   const [analysisStatus, setAnalysisStatus] = useState('idle')
   const [analysisError, setAnalysisError] = useState('')
+  const [chatThreads, setChatThreads] = useState([])
+  const [selectedChatThreadId, setSelectedChatThreadId] = useState(null)
+  const [chatMessages, setChatMessages] = useState([])
+  const [chatInput, setChatInput] = useState('')
+  const [chatStatus, setChatStatus] = useState('idle')
+  const [chatError, setChatError] = useState('')
 
   const loadProjects = useCallback(async () => {
     if (!telegramId) {
@@ -188,6 +220,21 @@ function App() {
     } catch (requestError) {
       setStatus('error')
       setError(requestError.message)
+    }
+  }, [activeProjectId, telegramId])
+
+  const loadChatThreads = useCallback(async () => {
+    if (!telegramId || !activeProjectId) {
+      return
+    }
+    try {
+      const response = await fetch(`/api/ai/chat/threads?project_id=${activeProjectId}`)
+      if (!response.ok) {
+        throw new Error('Не вдалося завантажити попередні діалоги.')
+      }
+      setChatThreads(await response.json())
+    } catch (requestError) {
+      setChatError(requestError.message || 'Не вдалося завантажити попередні діалоги.')
     }
   }, [activeProjectId, telegramId])
 
@@ -270,6 +317,18 @@ function App() {
     return () => window.clearTimeout(loadTimer)
   }, [activeProjectId, loadDashboard, telegramId])
 
+  useEffect(() => {
+    if (!telegramId || !activeProjectId) {
+      return undefined
+    }
+
+    setSelectedChatThreadId(null)
+    setChatMessages([])
+    setChatError('')
+    const loadTimer = window.setTimeout(() => { void loadChatThreads() }, 0)
+    return () => window.clearTimeout(loadTimer)
+  }, [activeProjectId, loadChatThreads, telegramId])
+
   async function verifyLogin(event) {
     event.preventDefault()
     const normalizedTelegramId = telegramIdInput.trim()
@@ -318,6 +377,12 @@ function App() {
     setActiveProjectId(null)
     setAnalysis(null)
     setAnalysisStatus('idle')
+    setChatThreads([])
+    setSelectedChatThreadId(null)
+    setChatMessages([])
+    setChatInput('')
+    setChatStatus('idle')
+    setChatError('')
     setStatus('idle')
     setAuthStatus('unauthenticated')
   }
@@ -494,6 +559,113 @@ function App() {
     }
   }
 
+  function startNewChat() {
+    if (chatStatus === 'sending') {
+      return
+    }
+    setSelectedChatThreadId(null)
+    setChatMessages([])
+    setChatInput('')
+    setChatError('')
+  }
+
+  async function selectChatThread(threadId) {
+    if (!activeProjectId || chatStatus === 'sending') {
+      return
+    }
+
+    setChatStatus('loading')
+    setChatError('')
+    try {
+      const response = await fetch(`/api/ai/chat/threads/${threadId}?project_id=${activeProjectId}`)
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(typeof body?.detail === 'string' ? body.detail : 'Не вдалося відкрити діалог.')
+      }
+      const thread = await response.json()
+      setSelectedChatThreadId(thread.id)
+      setChatMessages(thread.messages.map((message, index) => ({ ...message, id: `${thread.id}-${index}` })))
+    } catch (requestError) {
+      setChatError(requestError.message || 'Не вдалося відкрити діалог.')
+    } finally {
+      setChatStatus('idle')
+    }
+  }
+
+  async function sendChatMessage(event) {
+    event.preventDefault()
+    const message = chatInput.trim()
+    if (!message || !activeProjectId || chatStatus === 'sending') {
+      return
+    }
+
+    const pendingId = `assistant-${Date.now()}`
+    setChatStatus('sending')
+    setChatError('')
+    setChatInput('')
+
+    try {
+      const response = await fetch('/api/ai/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: JSON.stringify({
+          message,
+          project_id: activeProjectId,
+          thread_id: selectedChatThreadId,
+        }),
+      })
+      if (!response.ok || !response.body) {
+        const body = await response.json().catch(() => null)
+        throw new Error(typeof body?.detail === 'string' ? body.detail : 'Не вдалося надіслати повідомлення.')
+      }
+
+      setChatMessages((currentMessages) => [
+        ...currentMessages,
+        { id: `user-${Date.now()}`, role: 'user', content: message },
+        { id: pendingId, role: 'assistant', content: '' },
+      ])
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let streamError = null
+      const handleEvent = (eventName, payload) => {
+        if (eventName === 'thread' && payload.thread_id) {
+          setSelectedChatThreadId(payload.thread_id)
+        }
+        if (eventName === 'delta' && typeof payload.text === 'string') {
+          setChatMessages((currentMessages) => currentMessages.map((chatMessage) => (
+            chatMessage.id === pendingId
+              ? { ...chatMessage, content: `${chatMessage.content}${payload.text}` }
+              : chatMessage
+          )))
+        }
+        if (eventName === 'error') {
+          streamError = typeof payload.message === 'string' ? payload.message : 'Не вдалося сформувати відповідь.'
+        }
+      }
+
+      while (true) {
+        const { done, value } = await reader.read()
+        buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done })
+        buffer = consumeSseEvents(buffer, handleEvent)
+        if (done) {
+          break
+        }
+      }
+
+      if (streamError) {
+        throw new Error(streamError)
+      }
+      await loadChatThreads()
+    } catch (requestError) {
+      setChatMessages((currentMessages) => currentMessages.filter((chatMessage) => chatMessage.id !== pendingId))
+      setChatError(requestError.message || 'Не вдалося сформувати відповідь AI-помічника.')
+    } finally {
+      setChatStatus('idle')
+    }
+  }
+
   const mainCategoryTotals = useMemo(() => {
     const totals = new Map([['Роботи', 0], ['Матеріали', 0]])
     transactions
@@ -650,6 +822,71 @@ function App() {
               <strong>{isLoading ? '—' : formatCurrency(summary?.balance)}</strong>
               <span className="card-note">Дохід мінус витрати</span>
             </article>
+      </section>
+
+      <section className="panel ai-chat-panel" aria-label="AI-помічник">
+        <div className="panel-heading ai-chat-heading">
+          <div>
+            <p className="panel-kicker">Gemini AI · read-only</p>
+            <h2>AI-помічник фінансів</h2>
+            <p className="ai-chat-retention">Контекст діалогу зберігається 7 днів. Помічник може лише читати й аналізувати дані.</p>
+          </div>
+          <button className="new-chat-button" type="button" onClick={startNewChat} disabled={chatStatus === 'sending' || !activeProjectId}>
+            + Новий чат
+          </button>
+        </div>
+
+        <div className="ai-chat-layout">
+          <aside className="chat-thread-list" aria-label="Попередні діалоги">
+            <p className="chat-thread-label">Попередні діалоги</p>
+            {chatThreads.length > 0 ? chatThreads.map((thread) => (
+              <button
+                className={thread.id === selectedChatThreadId ? 'chat-thread-button chat-thread-button-active' : 'chat-thread-button'}
+                key={thread.id}
+                type="button"
+                onClick={() => { void selectChatThread(thread.id) }}
+                disabled={chatStatus === 'sending'}
+              >
+                <strong>{thread.title}</strong>
+                <small>{formatDate(thread.updated_at)}</small>
+              </button>
+            )) : <p className="chat-thread-empty">Тут з’являться ваші діалоги.</p>}
+          </aside>
+
+          <div className="chat-conversation">
+            <div className="chat-messages" aria-live="polite">
+              {chatStatus === 'loading' ? <p className="chat-placeholder">Завантажуємо діалог…</p> : null}
+              {chatStatus !== 'loading' && chatMessages.length === 0 ? (
+                <div className="chat-placeholder">
+                  <strong>Запитайте про фінанси цього проєкту</strong>
+                  <span>Наприклад: «Проаналізуй витрати за червень» або «Покажи найбільші ризики».</span>
+                </div>
+              ) : null}
+              {chatMessages.map((message) => (
+                <article className={`chat-message chat-message-${message.role}`} key={message.id}>
+                  <span>{message.role === 'user' ? 'Ви' : 'AI-помічник'}</span>
+                  <p>{message.content || (chatStatus === 'sending' ? 'Формуємо відповідь…' : '')}</p>
+                </article>
+              ))}
+            </div>
+            {chatError && <p className="transaction-form-error chat-error" role="alert">{chatError}</p>}
+            <form className="chat-input-form" onSubmit={sendChatMessage}>
+              <label className="visually-hidden" htmlFor="ai-chat-message">Запит до AI-помічника</label>
+              <textarea
+                id="ai-chat-message"
+                maxLength="2000"
+                value={chatInput}
+                onChange={(event) => setChatInput(event.target.value)}
+                placeholder="Напишіть запит про операції…"
+                disabled={!activeProjectId || chatStatus === 'sending' || chatStatus === 'loading'}
+                rows="2"
+              />
+              <button type="submit" disabled={!chatInput.trim() || !activeProjectId || chatStatus === 'sending' || chatStatus === 'loading'}>
+                {chatStatus === 'sending' ? 'Відповідаємо…' : 'Надіслати'}
+              </button>
+            </form>
+          </div>
+        </div>
       </section>
 
       <section className="panel ai-analysis-panel">
