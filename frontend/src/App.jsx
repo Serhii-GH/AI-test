@@ -138,6 +138,44 @@ function consumeSseEvents(buffer, onEvent) {
   return remainder
 }
 
+function GuestDashboard({ session, onLogout }) {
+  const [data, setData] = useState(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    fetch('/api/guest/dashboard')
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Не вдалося завантажити дані огляду.')
+        return response.json()
+      })
+      .then(setData)
+      .catch((requestError) => setError(requestError.message))
+  }, [])
+
+  return (
+    <main className="dashboard-shell">
+      <header className="dashboard-header">
+        <div>
+          <p className="eyebrow">Гостьовий перегляд</p>
+          <h1>{session.project_name}</h1>
+          <p className="subtitle">Доступ лише для перегляду. Редагування та видалення операцій недоступні.</p>
+        </div>
+        <button className="logout-button" type="button" onClick={onLogout}>Вийти</button>
+      </header>
+      {error && <section className="message-card error-card"><p>{error}</p></section>}
+      {!data && !error && <section className="message-card"><p>Завантажуємо дані…</p></section>}
+      {data && <>
+        <section className="summary-grid">
+          <article className="summary-card income-card"><span className="card-label">Загальний дохід</span><strong>{formatCurrency(data.summary.total_income)}</strong></article>
+          <article className="summary-card expense-card"><span className="card-label">Загальні витрати</span><strong>{formatCurrency(data.summary.total_expense)}</strong></article>
+          <article className="summary-card balance-card"><span className="card-label">Поточний баланс</span><strong>{formatCurrency(data.summary.balance)}</strong></article>
+        </section>
+        <section className="panel transaction-list"><h2>Операції</h2>{data.transactions.map((item) => <div className="transaction-row" key={item.id}><span>{formatDate(item.created_at)} · {item.main_category} · {item.subcategory}<small>{item.description}</small></span><strong>{formatCurrency(item.amount)}</strong></div>)}</section>
+      </>}
+    </main>
+  )
+}
+
 function App() {
   const [telegramId, setTelegramId] = useState(null)
   const [telegramUsername, setTelegramUsername] = useState(null)
@@ -146,6 +184,14 @@ function App() {
   const [authError, setAuthError] = useState('')
   const [telegramLogin, setTelegramLogin] = useState(null)
   const [loginAttempt, setLoginAttempt] = useState(0)
+  const [guestSession, setGuestSession] = useState(null)
+  const [showGuestLogin, setShowGuestLogin] = useState(false)
+  const [guestLogin, setGuestLogin] = useState('')
+  const [guestPassword, setGuestPassword] = useState('')
+  const [guestError, setGuestError] = useState('')
+  const [guestCredential, setGuestCredential] = useState(null)
+  const [guestAccesses, setGuestAccesses] = useState([])
+  const [guestAccessError, setGuestAccessError] = useState('')
   const [summary, setSummary] = useState(null)
   const [transactions, setTransactions] = useState([])
   const [projects, setProjects] = useState([])
@@ -262,8 +308,16 @@ function App() {
           setAuthStatus('authenticated')
         }
       } catch {
-        if (isCurrent) {
-          setAuthStatus('unauthenticated')
+        try {
+          const guestResponse = await fetch('/api/guest/session')
+          if (!guestResponse.ok) throw new Error('No guest session')
+          const guest = await guestResponse.json()
+          if (isCurrent) {
+            setGuestSession(guest)
+            setAuthStatus('guest')
+          }
+        } catch {
+          if (isCurrent) setAuthStatus('unauthenticated')
         }
       }
     }
@@ -341,6 +395,51 @@ function App() {
     }
   }, [authStatus, loginAttempt])
 
+  async function submitGuestLogin(event) {
+    event.preventDefault()
+    setGuestError('')
+    try {
+      const response = await fetch('/api/guest/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ login: guestLogin, password: guestPassword }) })
+      if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || 'Не вдалося увійти.')
+      setGuestSession(await response.json())
+      setAuthStatus('guest')
+    } catch (requestError) {
+      setGuestError(requestError.message)
+    }
+  }
+
+  async function logoutGuest() {
+    await fetch('/api/guest/logout', { method: 'POST' })
+    setGuestSession(null)
+    setGuestLogin('')
+    setGuestPassword('')
+    setAuthStatus('unauthenticated')
+  }
+
+  async function createGuestAccess() {
+    if (!activeProjectId) return
+    setGuestAccessError('')
+    try {
+      const response = await fetch(`/api/projects/${activeProjectId}/guest-accesses`, { method: 'POST' })
+      if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || 'Не вдалося створити доступ.')
+      const credential = await response.json()
+      setGuestCredential(credential)
+      setGuestAccesses((current) => [credential, ...current])
+    } catch (requestError) {
+      setGuestAccessError(requestError.message)
+    }
+  }
+
+  async function revokeGuestAccess() {
+    if (!guestCredential || !activeProjectId) return
+    const response = await fetch(`/api/projects/${activeProjectId}/guest-accesses/${guestCredential.id}`, { method: 'DELETE' })
+    if (response.ok) {
+      setGuestAccesses((current) => current.filter((access) => access.id !== guestCredential.id))
+      setGuestCredential(null)
+    }
+    else setGuestAccessError('Не вдалося відкликати доступ.')
+  }
+
   useEffect(() => {
     let avatarUrl = null
     let isCurrent = true
@@ -406,6 +505,15 @@ function App() {
     const loadTimer = window.setTimeout(() => { void loadChatThreads() }, 0)
     return () => window.clearTimeout(loadTimer)
   }, [activeProjectId, loadChatThreads, telegramId])
+
+  useEffect(() => {
+    if (!telegramId || !activeProjectId) return undefined
+    let current = true
+    fetch(`/api/projects/${activeProjectId}/guest-accesses`)
+      .then((response) => response.ok ? response.json() : [])
+      .then((accesses) => { if (current) setGuestAccesses(accesses) })
+    return () => { current = false }
+  }, [activeProjectId, telegramId])
 
   async function logout() {
     await fetch('/api/auth/logout', { method: 'POST' })
@@ -805,6 +913,10 @@ function App() {
   const hasMoreTransactions = displayedTransactions.length < visibleTransactions.length
   const isLoading = status === 'loading'
 
+  if (authStatus === 'guest' && guestSession) {
+    return <GuestDashboard session={guestSession} onLogout={logoutGuest} />
+  }
+
   return (
     <main className="dashboard-shell">
       <header className="dashboard-header">
@@ -843,13 +955,23 @@ function App() {
                 </span>
               )}
               <p className="telegram-login-help">Відкрийте бота та підтвердьте вхід. Сайт увійде автоматично — Telegram ID і код не потрібні.</p>
-              <button
-                type="button"
-                onClick={() => setLoginAttempt((attempt) => attempt + 1)}
-                disabled={authStatus === 'checking'}
-              >
-                Створити нове посилання
-              </button>
+              <button className="guest-login-toggle" type="button" onClick={() => setShowGuestLogin((value) => !value)}>Гостьовий вхід</button>
+              {authError && (
+                <button
+                  className="telegram-login-retry"
+                  type="button"
+                  onClick={() => setLoginAttempt((attempt) => attempt + 1)}
+                  disabled={authStatus === 'checking'}
+                >
+                  Створити нове посилання
+                </button>
+              )}
+              {showGuestLogin && <form className="guest-login-form" onSubmit={submitGuestLogin}>
+                <input value={guestLogin} onChange={(event) => setGuestLogin(event.target.value)} placeholder="Логін для перегляду" required />
+                <input type="password" value={guestPassword} onChange={(event) => setGuestPassword(event.target.value)} placeholder="Пароль" required />
+                <button type="submit">Увійти лише для перегляду</button>
+                {guestError && <small role="alert">{guestError}</small>}
+              </form>}
             </div>
           )}
         </div>
@@ -886,6 +1008,10 @@ function App() {
             >
               {isExporting ? 'Готуємо CSV…' : '⇩ Експортувати CSV'}
             </button>
+            <button className="export-button" type="button" onClick={createGuestAccess} disabled={!activeProjectId}>Створити гостьовий доступ</button>
+            {guestCredential && <div className="guest-credentials"><strong>{guestCredential.password ? 'Передайте лише цій людині:' : 'Активний гостьовий доступ:'}</strong><span>Логін: <code>{guestCredential.login}</code></span>{guestCredential.password && <span>Пароль: <code>{guestCredential.password}</code></span>}<button type="button" onClick={revokeGuestAccess}>Відкликати доступ</button></div>}
+            {guestAccesses.length > 0 && <div className="guest-access-list">Активні: {guestAccesses.map((access) => <button key={access.id} type="button" onClick={() => setGuestCredential(access)}>{access.login}</button>)}</div>}
+            {guestAccessError && <p className="transaction-form-error" role="alert">{guestAccessError}</p>}
           </div>
           <form className="new-project-form" onSubmit={createProject}>
             <label htmlFor="new-project-name">Новий огляд</label>
