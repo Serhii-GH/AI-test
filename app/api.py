@@ -14,6 +14,7 @@ from aiogram import Bot
 from dotenv import load_dotenv
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -239,6 +240,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Apartment Renovation Finance API", lifespan=lifespan)
+
+
+@app.get("/health")
+async def health_check() -> dict[str, str]:
+    """Report that the web service is ready to accept HTTP requests."""
+    return {"status": "ok"}
 
 
 async def require_authenticated_telegram_id(
@@ -833,3 +840,10 @@ async def analyze_transactions(
         if not os.getenv("GEMINI_API_KEY"):
             raise HTTPException(status_code=503, detail="AI-аналіз тимчасово недоступний.") from error
         raise HTTPException(status_code=502, detail="Не вдалося отримати коректний AI-аналіз. Спробуйте ще раз.") from error
+
+
+app.mount(
+    "/",
+    StaticFiles(directory="frontend/dist", html=True, check_dir=False),
+    name="frontend",
+)
