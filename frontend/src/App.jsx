@@ -21,6 +21,8 @@ const dateFormatter = new Intl.DateTimeFormat('uk-UA', {
 
 const barColors = ['#c65b3f', '#d5864c', '#8d9a70', '#556b63', '#b6a176', '#7d6656']
 const TRANSACTION_PAGE_SIZE = 10
+const TELEGRAM_BOT_USERNAME = 'my_first_131313_bot'
+const TELEGRAM_LOGIN_URL = `https://t.me/${TELEGRAM_BOT_USERNAME}?start=login`
 
 function getTodayForInput() {
   const now = new Date()
@@ -767,13 +769,18 @@ function App() {
             </>
           ) : (
             <form className="telegram-form login-form" onSubmit={verifyLogin}>
+              <a className="telegram-login-link" href={TELEGRAM_LOGIN_URL} target="_blank" rel="noreferrer">
+                <span>Відкрити Telegram-бота</span>
+                <strong>@{TELEGRAM_BOT_USERNAME}</strong>
+              </a>
+              <p className="telegram-login-help">Бот одразу надішле ваш Telegram ID і одноразовий код для входу.</p>
               <label htmlFor="telegram-id">Telegram ID</label>
               <input
                 id="telegram-id"
                 inputMode="numeric"
                 value={telegramIdInput}
                 onChange={(event) => setTelegramIdInput(event.target.value)}
-                placeholder="З команди /id"
+                placeholder="Із повідомлення бота"
                 disabled={authStatus === 'checking' || authStatus === 'verifying'}
               />
               <label htmlFor="login-code">Код із бота</label>
@@ -839,7 +846,7 @@ function App() {
       {authStatus === 'unauthenticated' && (
         <section className="message-card bind-card">
           <h2>Увійдіть через Telegram</h2>
-          <p>Надішліть боту <code>/login</code>. Він надішле одноразовий 6-значний код, який дійсний 5 хвилин. Введіть його разом зі своїм Telegram ID вище.</p>
+          <p>Натисніть «Відкрити Telegram-бота» вище. Бот <code>@{TELEGRAM_BOT_USERNAME}</code> надішле ваш Telegram ID і одноразовий 6-значний код, який дійсний 5 хвилин.</p>
           {authError && <p className="transaction-form-error" role="alert">{authError}</p>}
         </section>
       )}

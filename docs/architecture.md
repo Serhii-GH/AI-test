@@ -29,11 +29,11 @@ FastAPI віддає зібраний React із `frontend/dist`. Запити �
 ### Авторизація через Telegram
 
 ```text
-Користувач -> Telegram /login -> Telegram-бот -> Neon (одноразовий код)
+Користувач -> кнопка «Відкрити Telegram-бота» -> Telegram /start login -> Telegram-бот -> Neon (одноразовий код)
 Користувач -> Web dashboard -> POST /api/auth/verify -> FastAPI -> Neon (сесія)
 ```
 
-Сесія браузера зберігається в HttpOnly cookie. У production `SESSION_COOKIE_SECURE=true`, тому cookie надсилається лише через HTTPS.
+Deep link відкриває публічного бота `@my_first_131313_bot`; бот надсилає користувачеві його Telegram ID і одноразовий код. Сесія браузера зберігається в HttpOnly cookie. У production `SESSION_COOKIE_SECURE=true`, тому cookie надсилається лише через HTTPS.
 
 ### AI-функції
 

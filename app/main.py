@@ -120,8 +120,34 @@ def transaction_details(transaction: dict[str, object]) -> str:
     )
 
 
+async def send_web_login_code(message: Message) -> None:
+    """Create and send a dashboard login code to the Telegram user."""
+    if database_engine is None or message.from_user is None:
+        await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
+        return
+
+    try:
+        code = await create_web_login_code(database_engine, message.from_user.id)
+    except Exception:
+        logger.exception("could not create web login code")
+        await message.answer("Не вдалося створити код входу. Спробуйте ще раз.")
+        return
+
+    await message.answer(
+        f"Ваш код для входу у web dashboard: {code}\n"
+        f"Ваш Telegram ID: {message.from_user.id}\n\n"
+        "Введіть обидва значення на сайті. Код дійсний 5 хвилин, одноразовий і має не більше 5 спроб введення."
+    )
+
+
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
+    payload = (message.text or "").partition(" ")[2].strip().casefold()
+    if payload == "login":
+        logger.info("received Telegram login deep link")
+        await send_web_login_code(message)
+        return
+
     logger.info("received /start command")
     await message.answer(f"Вітаю!\n\n{COMMANDS_DESCRIPTION}")
 
@@ -144,21 +170,7 @@ async def telegram_id_handler(message: Message) -> None:
 @dp.message(Command("login"))
 async def login_handler(message: Message) -> None:
     """Send a short-lived one-time code for the web dashboard."""
-    if database_engine is None or message.from_user is None:
-        await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
-        return
-
-    try:
-        code = await create_web_login_code(database_engine, message.from_user.id)
-    except Exception:
-        logger.exception("could not create web login code")
-        await message.answer("Не вдалося створити код входу. Спробуйте ще раз.")
-        return
-
-    await message.answer(
-        f"Ваш код для входу у web dashboard: {code}\n\n"
-        "Він дійсний 5 хвилин, одноразовий і має не більше 5 спроб введення."
-    )
+    await send_web_login_code(message)
 
 
 @dp.message(Command("cancel"))
