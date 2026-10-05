@@ -358,6 +358,31 @@ h2 {
   margin-top: 11px;
 }
 
+.export-button {
+  margin-top: 12px;
+  border: 1px solid rgba(141, 154, 112, 0.72);
+  border-radius: 8px;
+  background: rgba(85, 107, 99, 0.25);
+  color: #e4ebd6;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 750;
+  padding: 9px 12px;
+  transition: transform 160ms ease, background 160ms ease, box-shadow 160ms ease;
+}
+
+.export-button:hover:not(:disabled) {
+  transform: translateY(-2px);
+  background: rgba(85, 107, 99, 0.46);
+  box-shadow: 0 8px 18px rgba(15, 21, 18, 0.22);
+}
+
+.export-button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
 .project-tab {
   border: 1px solid rgba(226, 212, 180, 0.24);
   border-radius: 8px;

@@ -153,6 +153,8 @@ function App() {
   const [newProjectName, setNewProjectName] = useState('')
   const [projectError, setProjectError] = useState('')
   const [isCreatingProject, setIsCreatingProject] = useState(false)
+  const [isExporting, setIsExporting] = useState(false)
+  const [exportError, setExportError] = useState('')
   const [status, setStatus] = useState('idle')
   const [error, setError] = useState('')
   const [transactionForm, setTransactionForm] = useState(createEmptyTransactionForm)
@@ -464,6 +466,37 @@ function App() {
       setProjectError(requestError.message || 'Не вдалося створити проєкт. Спробуйте ще раз.')
     } finally {
       setIsCreatingProject(false)
+    }
+  }
+
+  async function exportTransactions() {
+    if (!activeProjectId) {
+      return
+    }
+
+    setIsExporting(true)
+    setExportError('')
+    try {
+      const response = await fetch(`/api/transactions/export?project_id=${activeProjectId}`)
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(typeof body?.detail === 'string' ? body.detail : 'Не вдалося експортувати операції.')
+      }
+
+      const blob = await response.blob()
+      const downloadUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      const filename = response.headers.get('content-disposition')?.match(/filename="?([^";]+)"?/)?.[1]
+      link.href = downloadUrl
+      link.download = filename || 'finance-export.csv'
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(downloadUrl)
+    } catch (requestError) {
+      setExportError(requestError.message || 'Не вдалося експортувати операції. Спробуйте ще раз.')
+    } finally {
+      setIsExporting(false)
     }
   }
 
@@ -845,6 +878,14 @@ function App() {
                 </button>
               ))}
             </div>
+            <button
+              className="export-button"
+              type="button"
+              onClick={exportTransactions}
+              disabled={!activeProjectId || isExporting}
+            >
+              {isExporting ? 'Готуємо CSV…' : '⇩ Експортувати CSV'}
+            </button>
           </div>
           <form className="new-project-form" onSubmit={createProject}>
             <label htmlFor="new-project-name">Новий огляд</label>
@@ -861,6 +902,7 @@ function App() {
             </button>
           </form>
           {projectError && <p className="transaction-form-error" role="alert">{projectError}</p>}
+          {exportError && <p className="transaction-form-error" role="alert">{exportError}</p>}
         </section>
       )}
 
