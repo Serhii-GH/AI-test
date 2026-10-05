@@ -632,6 +632,12 @@ h2 {
   gap: 17px;
 }
 
+.content-grid > .panel,
+.chart-panel,
+.transaction-panel {
+  min-width: 0;
+}
+
 .panel { padding: 27px; }
 .panel-heading { gap: 16px; padding-bottom: 17px; border-bottom: 1px solid rgba(226, 212, 180, 0.16); }
 
@@ -654,7 +660,7 @@ h2 {
 
 .distribution-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
   gap: 14px;
   margin-top: 19px;
 }
@@ -831,7 +837,9 @@ h2 {
 .filter-button-active { border-color: #e4b16e; background: rgba(228, 177, 110, 0.16); color: #f3d6a5; }
 
 .transaction-table-wrapper {
+  max-width: 100%;
   overflow-x: auto;
+  overscroll-behavior-x: contain;
   margin: 3px -6px -6px;
   padding: 0 6px 6px;
 }
@@ -1160,6 +1168,8 @@ h2 {
   .dashboard-header { padding: 25px 21px; border-radius: 20px; }
   .panel, .summary-card, .message-card { padding: 21px; }
   .transaction-form { grid-template-columns: 1fr; }
+  .distribution-grid { grid-template-columns: minmax(0, 1fr); }
+  .transaction-table-wrapper { margin-right: 0; margin-left: 0; padding-right: 0; padding-left: 0; }
   .bar-chart { gap: 7px; }
   .bar-column { grid-template-rows: auto 154px auto; }
   .bar-track { height: 154px; }
