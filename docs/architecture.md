@@ -5,8 +5,8 @@
 | Компонент | Технології | Відповідальність |
 | --- | --- | --- |
 | Web frontend | React + Vite | Інтерфейс фінансових оглядів, проєктів, транзакцій та AI-чату. |
-| Web API | FastAPI | API `/api/*`, авторизація через одноразовий Telegram-код, health check і роздавання React-збірки. |
-| Telegram-бот | aiogram | Polling Telegram, команди користувача та створення одноразового коду для входу через `/login`. |
+| Web API | FastAPI | API `/api/*`, browser-bound авторизація через Telegram, health check і роздавання React-збірки. |
+| Telegram-бот | aiogram | Polling Telegram, команди користувача та підтвердження входу з browser challenge. |
 | База даних | Neon PostgreSQL | Користувачі, проєкти, транзакції, сесії, ліміти та AI-історія. |
 | AI | Gemini | Аналіз транзакцій та AI-помічник фінансів. |
 | Production-платформа | Render | Один Docker Web Service із FastAPI, React-збіркою та Telegram-ботом. |
@@ -29,11 +29,13 @@ FastAPI віддає зібраний React із `frontend/dist`. Запити �
 ### Авторизація через Telegram
 
 ```text
-Користувач -> кнопка «Відкрити Telegram-бота» -> Telegram /start login -> Telegram-бот -> Neon (одноразовий код)
-Користувач -> Web dashboard -> POST /api/auth/verify -> FastAPI -> Neon (сесія)
+Browser -> POST /api/auth/challenges -> FastAPI -> Neon (одноразовий challenge)
+Користувач -> кнопка «Відкрити Telegram-бота» -> Telegram /start login_<challenge>
+Telegram-бот -> Neon (challenge прив'язано до Telegram ID)
+Browser -> GET /api/auth/challenges/<challenge> -> FastAPI -> Neon (HttpOnly сесія)
 ```
 
-Deep link відкриває публічного бота `@my_first_131313_bot`; бот надсилає користувачеві його Telegram ID і одноразовий код. Сесія браузера зберігається в HttpOnly cookie. У production `SESSION_COOKIE_SECURE=true`, тому cookie надсилається лише через HTTPS.
+Deep link відкриває публічного бота `@my_first_131313_bot`. Challenge є випадковим, зберігається в базі лише як SHA-256 хеш, діє 5 хвилин і споживається після створення сесії. Бот підтверджує саме цей challenge за Telegram ID користувача, а браузер опитує його статус. Telegram ID і код не вводяться вручну. Сесія браузера зберігається в HttpOnly cookie. У production `SESSION_COOKIE_SECURE=true`, тому cookie надсилається лише через HTTPS.
 
 ### AI-функції
 
@@ -80,5 +82,6 @@ Render перевіряє `GET /health`. Endpoint повертає:
 - `DATABASE_URL`;
 - `GEMINI_API_KEY`;
 - `SESSION_COOKIE_SECURE=true`.
+- `TELEGRAM_BOT_USERNAME` — публічне ім'я бота для deep link (не секрет).
 
 Деталі розгортання описані в [deploy.md](deploy.md), а DNS і власний домен — у [domain.md](domain.md).

@@ -19,8 +19,8 @@ from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.database import (
+    approve_web_login_challenge,
     check_database_connection,
-    create_web_login_code,
     create_database_engine,
     delete_user_transaction,
     get_user_transaction,
@@ -44,7 +44,7 @@ COMMANDS_DESCRIPTION = (
     "/add — додати дохід або витрату покроково\n"
     "/expense — додати операцію покроково\n"
     "/id — показати ваш Telegram ID\n"
-    "/login — отримати одноразовий код для входу у web dashboard\n"
+    "/login — як увійти у web dashboard\n"
     "/transactions — показати останні операції\n"
     "/delete <ID> — видалити операцію\n"
     "/cancel — скасувати поточне введення\n"
@@ -120,32 +120,45 @@ def transaction_details(transaction: dict[str, object]) -> str:
     )
 
 
-async def send_web_login_code(message: Message) -> None:
-    """Create and send a dashboard login code to the Telegram user."""
+async def approve_browser_login(message: Message, challenge: str) -> None:
+    """Approve the browser that created a one-time Telegram login challenge."""
     if database_engine is None or message.from_user is None:
         await message.answer("База даних ще не готова. Спробуйте трохи пізніше.")
         return
 
     try:
-        code = await create_web_login_code(database_engine, message.from_user.id)
+        approved = await approve_web_login_challenge(
+            database_engine,
+            challenge,
+            message.from_user.id,
+        )
     except Exception:
-        logger.exception("could not create web login code")
-        await message.answer("Не вдалося створити код входу. Спробуйте ще раз.")
+        logger.exception("could not approve browser login challenge")
+        await message.answer("Не вдалося підтвердити вхід. Спробуйте ще раз на сайті.")
+        return
+
+    if not approved:
+        await message.answer(
+            "Це посилання для входу вже використане або прострочене. "
+            "Поверніться на сайт і створіть нове."
+        )
         return
 
     await message.answer(
-        f"Ваш код для входу у web dashboard: {code}\n"
-        f"Ваш Telegram ID: {message.from_user.id}\n\n"
-        "Введіть обидва значення на сайті. Код дійсний 5 хвилин, одноразовий і має не більше 5 спроб введення."
+        "Вхід підтверджено. Поверніться на сайт — сторінка оновиться автоматично."
     )
 
 
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
-    payload = (message.text or "").partition(" ")[2].strip().casefold()
+    payload = (message.text or "").partition(" ")[2].strip()
+    if payload.startswith("login_"):
+        logger.info("received Telegram browser login deep link")
+        await approve_browser_login(message, payload.removeprefix("login_"))
+        return
+
     if payload == "login":
-        logger.info("received Telegram login deep link")
-        await send_web_login_code(message)
+        await message.answer("Відкрийте сайт і натисніть «Відкрити Telegram-бота» для автоматичного входу.")
         return
 
     logger.info("received /start command")
@@ -164,13 +177,13 @@ async def telegram_id_handler(message: Message) -> None:
         await message.answer("Не вдалося визначити ваш Telegram ID.")
         return
 
-    await message.answer(f"Ваш Telegram ID: {message.from_user.id}\nВведіть його у web dashboard для перегляду своїх даних.")
+    await message.answer(f"Ваш Telegram ID: {message.from_user.id}\nВхід у web dashboard тепер підтверджується автоматично через кнопку на сайті.")
 
 
 @dp.message(Command("login"))
 async def login_handler(message: Message) -> None:
-    """Send a short-lived one-time code for the web dashboard."""
-    await send_web_login_code(message)
+    """Explain the browser-bound web login flow."""
+    await message.answer("Відкрийте сайт і натисніть «Відкрити Telegram-бота» для автоматичного входу.")
 
 
 @dp.message(Command("cancel"))
