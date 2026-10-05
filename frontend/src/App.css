@@ -61,13 +61,13 @@
 }
 
 .telegram-form {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 5px 7px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
 }
 
 .telegram-login-link {
-  grid-column: 1 / -1;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -101,11 +101,12 @@
 }
 
 .telegram-login-help {
-  grid-column: 1 / -1;
   margin: 2px 0 5px;
   color: #c2bdaf;
   font-size: 0.72rem;
   line-height: 1.35;
+  max-width: 255px;
+  text-align: right;
 }
 
 .telegram-form label {
@@ -146,11 +147,66 @@
 }
 
 .telegram-form button {
-  grid-column: 1 / -1;
   background: #e4b16e;
   color: #2a312c;
   font-size: 0.77rem;
   padding: 10px 12px;
+}
+
+.telegram-login-retry {
+  padding: 7px 10px !important;
+}
+
+.guest-login-toggle {
+  padding: 7px 10px !important;
+  background: rgba(255, 255, 255, 0.12) !important;
+  color: #fffaf3 !important;
+}
+
+.guest-login-form,
+.guest-credentials {
+  display: grid;
+  gap: 7px;
+  width: min(100%, 255px);
+}
+
+.guest-login-form input {
+  min-width: 0;
+  border: 1px solid rgba(243, 235, 218, 0.38);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.09);
+  color: #fffdf5;
+  font: inherit;
+  padding: 9px;
+}
+
+.guest-login-form small { color: #f2a18b; }
+
+.guest-credentials {
+  margin-top: 10px;
+  color: #ddd4bd;
+  font-size: 0.78rem;
+}
+
+.guest-credentials code { color: #f3d6a5; }
+
+.guest-access-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  color: #c8bda7;
+  font-size: 0.74rem;
+}
+
+.guest-access-list button {
+  border: 1px solid rgba(226, 212, 180, 0.24);
+  border-radius: 6px;
+  background: transparent;
+  color: #f3d6a5;
+  cursor: pointer;
+  font: inherit;
+  padding: 3px 6px;
 }
 
 .telegram-form button:hover,

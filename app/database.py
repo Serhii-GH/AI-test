@@ -137,6 +137,26 @@ web_sessions = Table(
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
+guest_accesses = Table(
+    "guest_accesses", metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("owner_telegram_id", BigInteger, nullable=False, index=True),
+    Column("project_id", BigInteger, ForeignKey("projects.id"), nullable=False, index=True),
+    Column("login", String(64), nullable=False, unique=True),
+    Column("password_hash", String(64), nullable=False),
+    Column("revoked_at", DateTime(timezone=True)),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+guest_sessions = Table(
+    "guest_sessions", metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("guest_access_id", BigInteger, ForeignKey("guest_accesses.id"), nullable=False, index=True),
+    Column("token_hash", String(64), nullable=False, unique=True),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
 ai_analysis_cache = Table(
     "ai_analysis_cache",
     metadata,
@@ -868,6 +888,88 @@ async def delete_web_session(engine: AsyncEngine, token: str) -> None:
         await connection.execute(
             delete(web_sessions).where(web_sessions.c.token_hash == _hash_auth_value(token))
         )
+
+
+async def create_guest_access(engine: AsyncEngine, telegram_id: int, project_id: int) -> tuple[dict[str, object], str]:
+    """Create a read-only project credential; the password is returned only once."""
+    login = f"guest-{secrets.token_urlsafe(6)}"
+    password = secrets.token_urlsafe(18)
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            insert(guest_accesses)
+            .values(
+                owner_telegram_id=telegram_id,
+                project_id=project_id,
+                login=login,
+                password_hash=_hash_auth_value(password),
+            )
+            .returning(guest_accesses.c.id, guest_accesses.c.login, guest_accesses.c.created_at)
+        )
+        return dict(result.mappings().one()), password
+
+
+async def list_guest_accesses(engine: AsyncEngine, telegram_id: int, project_id: int) -> list[dict[str, object]]:
+    statement = select(guest_accesses.c.id, guest_accesses.c.login, guest_accesses.c.created_at).where(
+        guest_accesses.c.owner_telegram_id == telegram_id,
+        guest_accesses.c.project_id == project_id,
+        guest_accesses.c.revoked_at.is_(None),
+    ).order_by(desc(guest_accesses.c.created_at))
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        return [dict(row) for row in result.mappings().all()]
+
+
+async def revoke_guest_access(engine: AsyncEngine, telegram_id: int, project_id: int, access_id: int) -> bool:
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            update(guest_accesses).where(
+                guest_accesses.c.id == access_id,
+                guest_accesses.c.owner_telegram_id == telegram_id,
+                guest_accesses.c.project_id == project_id,
+                guest_accesses.c.revoked_at.is_(None),
+            ).values(revoked_at=datetime.now(timezone.utc))
+        )
+        return result.rowcount == 1
+
+
+async def create_guest_session(engine: AsyncEngine, login: str, password: str) -> str | None:
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            select(guest_accesses).where(guest_accesses.c.login == login).with_for_update()
+        )
+        access = result.mappings().one_or_none()
+        if access is None or access["revoked_at"] is not None or not secrets.compare_digest(
+            access["password_hash"], _hash_auth_value(password)
+        ):
+            return None
+        token = secrets.token_urlsafe(32)
+        await connection.execute(insert(guest_sessions).values(
+            guest_access_id=access["id"], token_hash=_hash_auth_value(token), expires_at=now + timedelta(days=7)
+        ))
+        return token
+
+
+async def get_guest_session(engine: AsyncEngine, token: str) -> dict[str, object] | None:
+    statement = select(
+        guest_accesses.c.id.label("access_id"), guest_accesses.c.owner_telegram_id,
+        guest_accesses.c.project_id, projects.c.name.label("project_name")
+    ).select_from(
+        guest_sessions.join(guest_accesses).join(projects)
+    ).where(
+        guest_sessions.c.token_hash == _hash_auth_value(token),
+        guest_sessions.c.expires_at > datetime.now(timezone.utc),
+        guest_accesses.c.revoked_at.is_(None),
+    )
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        row = result.mappings().one_or_none()
+        return dict(row) if row is not None else None
+
+
+async def delete_guest_session(engine: AsyncEngine, token: str) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(delete(guest_sessions).where(guest_sessions.c.token_hash == _hash_auth_value(token)))
 
 
 async def list_user_projects(engine: AsyncEngine, telegram_id: int) -> list[dict[str, object]]:
