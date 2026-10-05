@@ -1,0 +1,18 @@
+{
+  "name": "Фінансовий огляд ремонту",
+  "short_name": "Ремонт фінанси",
+  "description": "Облік бюджету, витрат і балансу ремонту.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b100d",
+  "theme_color": "#18231d",
+  "lang": "uk",
+  "icons": [
+    {
+      "src": "/pwa-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
