@@ -38,7 +38,7 @@ After a deploy, confirm:
 1. Render Deploy Logs show FastAPI and `bot started` / `Start polling`.
 2. `GET /health` returns `200` and `{"status":"ok"}`.
 3. The technical Render URL and the custom production URL open the dashboard.
-4. `/login` in Telegram sends a one-time login code.
+4. Кнопка входу відкриває `@my_first_131313_bot`; deep link `/start login` надсилає Telegram ID і одноразовий код.
 5. Database and Gemini-powered features work without secrets appearing in browser code or logs.
 
 Custom-domain DNS, HTTPS verification and Free-plan limitations are documented in [domain.md](domain.md).
