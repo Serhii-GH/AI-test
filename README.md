@@ -1,5 +1,9 @@
 # Telegram-бот
 
+## Production
+
+The application is deployed on Render. See [production deployment](docs/deploy.md) for the public URL, deployment settings, environment variables and verification checklist. DNS and custom-domain details are in [domain setup](docs/domain.md).
+
 ## API для майбутнього веб-інтерфейсу
 
 Бекенд надає endpoint `GET /api/transactions`. Він читає транзакції з PostgreSQL
