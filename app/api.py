@@ -1,7 +1,8 @@
 import asyncio
+import csv
 import json
 import logging
-from io import BytesIO
+from io import BytesIO, StringIO
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -376,6 +377,41 @@ def sse_event(event: str, payload: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def transactions_csv(transactions: list[dict[str, object]]) -> str:
+    """Serialize dashboard transactions into an Excel-friendly UTF-8 CSV."""
+    output = StringIO(newline="")
+    writer = csv.writer(output, delimiter=";")
+    writer.writerow(
+        [
+            "ID",
+            "Дата",
+            "Тип операції",
+            "Категорія",
+            "Підкатегорія",
+            "Опис",
+            "Сума, грн",
+            "Курс грн/USD",
+            "Сума, USD",
+        ]
+    )
+    for transaction in transactions:
+        created_at = transaction["created_at"]
+        writer.writerow(
+            [
+                transaction["id"],
+                created_at.date().isoformat() if isinstance(created_at, datetime) else created_at,
+                "Дохід" if transaction["transaction_type"] == "income" else "Витрата",
+                transaction.get("main_category") or "",
+                transaction["subcategory"],
+                transaction.get("description") or "",
+                transaction["amount"],
+                transaction["exchange_rate"] if transaction.get("exchange_rate") is not None else "",
+                transaction["amount_usd"] if transaction.get("amount_usd") is not None else "",
+            ]
+        )
+    return "\ufeff" + output.getvalue()
+
+
 @app.post("/api/auth/challenges", response_model=LoginChallengeResponse)
 async def create_login_challenge(
     request: Request,
@@ -623,6 +659,27 @@ async def list_transactions(
     engine: AsyncEngine = request.app.state.database_engine
     await require_user_project(engine, telegram_id, project_id)
     return await get_transactions(engine, telegram_id, project_id)
+
+
+@app.get("/api/transactions/export")
+async def export_transactions_csv(
+    request: Request,
+    project_id: Annotated[int, Query(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> Response:
+    """Download all transactions from one owned project as a UTF-8 CSV file."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    transactions = await get_transactions(engine, telegram_id, project_id)
+    filename = f"finance-export-project-{project_id}-{date.today().isoformat()}.csv"
+    return Response(
+        content=transactions_csv(transactions),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.post("/api/transactions", response_model=TransactionResponse, status_code=201)
