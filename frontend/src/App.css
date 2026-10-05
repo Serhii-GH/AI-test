@@ -137,7 +137,8 @@
 .telegram-form button,
 .refresh-button,
 .retry-button,
-.logout-button {
+.logout-button,
+.install-app-button {
   border: 0;
   border-radius: 8px;
   cursor: pointer;
@@ -264,6 +265,15 @@ h2 {
   color: #fffaf3;
   font-size: 0.76rem;
 }
+
+.install-app-button {
+  padding: 9px 11px;
+  background: rgba(109, 144, 123, 0.28);
+  border: 1px solid rgba(141, 154, 112, 0.72);
+  color: #edf3df;
+}
+
+.install-app-button:hover { background: rgba(109, 144, 123, 0.48); }
 
 .retry-button {
   padding: 9px 11px;

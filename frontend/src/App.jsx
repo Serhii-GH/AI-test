@@ -192,6 +192,7 @@ function App() {
   const [guestCredential, setGuestCredential] = useState(null)
   const [guestAccesses, setGuestAccesses] = useState([])
   const [guestAccessError, setGuestAccessError] = useState('')
+  const [installPrompt, setInstallPrompt] = useState(null)
   const [summary, setSummary] = useState(null)
   const [transactions, setTransactions] = useState([])
   const [projects, setProjects] = useState([])
@@ -221,6 +222,22 @@ function App() {
   const [chatError, setChatError] = useState('')
   const [pendingActions, setPendingActions] = useState([])
   const [resolvingActionId, setResolvingActionId] = useState(null)
+
+  useEffect(() => {
+    function captureInstallPrompt(event) {
+      event.preventDefault()
+      setInstallPrompt(event)
+    }
+
+    window.addEventListener('beforeinstallprompt', captureInstallPrompt)
+    return () => window.removeEventListener('beforeinstallprompt', captureInstallPrompt)
+  }, [])
+
+  async function installApp() {
+    if (!installPrompt) return
+    await installPrompt.prompt()
+    setInstallPrompt(null)
+  }
 
   const loadProjects = useCallback(async () => {
     if (!telegramId) {
@@ -926,6 +943,7 @@ function App() {
           <p className="subtitle">Контролюйте бюджет, витрати та баланс в одному місці.</p>
         </div>
         <div className="header-actions">
+          {installPrompt && <button className="install-app-button" type="button" onClick={installApp}>⊕ Додати на екран</button>}
           {authStatus === 'authenticated' ? (
             <>
               <div className="authenticated-user">
