@@ -33,6 +33,8 @@ from app.database import (
     create_web_login_challenge,
     create_user_project,
     create_web_session,
+    create_guest_access,
+    create_guest_session,
     create_database_engine,
     claim_pending_ai_action,
     confirm_pending_create_transaction_action,
@@ -40,6 +42,7 @@ from app.database import (
     consume_web_login_challenge,
     delete_ai_chat_threads,
     delete_web_session,
+    delete_guest_session,
     get_ai_chat_thread,
     get_financial_summary,
     get_cached_ai_analysis,
@@ -47,17 +50,20 @@ from app.database import (
     get_transactions,
     get_user_project,
     get_web_session_telegram_id,
+    get_guest_session,
     initialize_database,
     list_expired_ai_chat_thread_ids,
     list_pending_ai_actions,
     list_ai_chat_threads,
     list_user_projects,
+    list_guest_accesses,
     record_ai_analysis_metric,
     record_ai_action_audit,
     save_cached_ai_analysis,
     delete_user_transaction,
     save_transaction,
     save_ai_chat_memory_summary,
+    revoke_guest_access,
     touch_ai_chat_thread,
     verify_web_login_code,
 )
@@ -151,6 +157,31 @@ class LoginChallengeStatusResponse(BaseModel):
     username: str | None = None
 
 
+class GuestLoginRequest(BaseModel):
+    login: Annotated[str, Field(min_length=6, max_length=64)]
+    password: Annotated[str, Field(min_length=12, max_length=128)]
+
+
+class GuestAccessResponse(BaseModel):
+    id: int
+    login: str
+    created_at: datetime
+
+
+class CreatedGuestAccessResponse(GuestAccessResponse):
+    password: str
+
+
+class GuestSessionResponse(BaseModel):
+    project_id: int
+    project_name: str
+
+
+class GuestDashboardResponse(GuestSessionResponse):
+    summary: FinancialSummaryResponse
+    transactions: list[TransactionResponse]
+
+
 class ChatRequest(BaseModel):
     message: Annotated[str, Field(min_length=1, max_length=2_000)]
     project_id: Annotated[int, Field(gt=0)]
@@ -184,6 +215,7 @@ class ActionExecutionResponse(BaseModel):
 
 
 SESSION_COOKIE_NAME = "admin_session"
+GUEST_SESSION_COOKIE_NAME = "guest_session"
 SESSION_DURATION_SECONDS = 7 * 24 * 60 * 60
 CHAT_RETENTION = timedelta(days=7)
 AUTH_VERIFY_LIMIT = 10
@@ -218,6 +250,13 @@ def set_session_cookie(response: Response, session_token: str) -> None:
         httponly=True,
         samesite="lax",
         secure=session_cookie_secure(),
+    )
+
+
+def set_guest_session_cookie(response: Response, session_token: str) -> None:
+    response.set_cookie(
+        key=GUEST_SESSION_COOKIE_NAME, value=session_token, max_age=SESSION_DURATION_SECONDS,
+        httponly=True, samesite="lax", secure=session_cookie_secure(),
     )
 
 
@@ -298,6 +337,19 @@ async def require_authenticated_telegram_id(
     if telegram_id is None:
         raise HTTPException(status_code=401, detail="Сесія недійсна або завершилася.")
     return telegram_id
+
+
+async def require_guest_session(
+    request: Request,
+    session_token: Annotated[str | None, Cookie(alias=GUEST_SESSION_COOKIE_NAME)] = None,
+) -> dict[str, object]:
+    if not session_token:
+        raise HTTPException(status_code=401, detail="Потрібен гостьовий доступ.")
+    engine: AsyncEngine = request.app.state.database_engine
+    guest = await get_guest_session(engine, session_token)
+    if guest is None:
+        raise HTTPException(status_code=401, detail="Гостьовий доступ недійсний або відкликаний.")
+    return guest
 
 
 async def require_user_project(engine: AsyncEngine, telegram_id: int, project_id: int) -> None:
@@ -468,6 +520,46 @@ async def logout(
     )
 
 
+@app.post("/api/guest/login", response_model=GuestSessionResponse)
+async def guest_login(request: Request, response: Response, credentials: GuestLoginRequest) -> dict[str, object]:
+    engine: AsyncEngine = request.app.state.database_engine
+    await enforce_rate_limit(engine, scope="guest_login", subject=request_client_ip(request), limit=10, window=timedelta(minutes=10))
+    token = await create_guest_session(engine, credentials.login.strip(), credentials.password)
+    if token is None:
+        raise HTTPException(status_code=401, detail="Невірний логін або пароль.")
+    set_guest_session_cookie(response, token)
+    guest = await get_guest_session(engine, token)
+    return {"project_id": guest["project_id"], "project_name": guest["project_name"]}
+
+
+@app.get("/api/guest/session", response_model=GuestSessionResponse)
+async def get_guest_access_session(guest: Annotated[dict[str, object], Depends(require_guest_session)]) -> dict[str, object]:
+    return {"project_id": guest["project_id"], "project_name": guest["project_name"]}
+
+
+@app.get("/api/guest/dashboard", response_model=GuestDashboardResponse)
+async def get_guest_dashboard(
+    request: Request,
+    guest: Annotated[dict[str, object], Depends(require_guest_session)],
+) -> dict[str, object]:
+    engine: AsyncEngine = request.app.state.database_engine
+    project_id = int(guest["project_id"])
+    owner_id = int(guest["owner_telegram_id"])
+    return {
+        "project_id": project_id, "project_name": guest["project_name"],
+        "summary": await get_financial_summary(engine, int(owner_id), project_id),
+        "transactions": await get_transactions(engine, int(owner_id), project_id),
+    }
+
+
+@app.post("/api/guest/logout", status_code=204)
+async def guest_logout(request: Request, response: Response) -> None:
+    token = request.cookies.get(GUEST_SESSION_COOKIE_NAME)
+    if token:
+        await delete_guest_session(request.app.state.database_engine, token)
+    response.delete_cookie(key=GUEST_SESSION_COOKIE_NAME, httponly=True, samesite="lax", secure=session_cookie_secure())
+
+
 @app.get("/api/projects", response_model=list[ProjectResponse])
 async def list_projects(
     request: Request,
@@ -488,6 +580,37 @@ async def create_project(
     if created_project is None:
         raise HTTPException(status_code=409, detail="Проєкт із такою назвою вже існує.")
     return created_project
+
+
+@app.get("/api/projects/{project_id}/guest-accesses", response_model=list[GuestAccessResponse])
+async def get_project_guest_accesses(
+    request: Request, project_id: Annotated[int, Path(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> list[dict[str, object]]:
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    return await list_guest_accesses(engine, telegram_id, project_id)
+
+
+@app.post("/api/projects/{project_id}/guest-accesses", response_model=CreatedGuestAccessResponse, status_code=201)
+async def create_project_guest_access(
+    request: Request, project_id: Annotated[int, Path(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> dict[str, object]:
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    access, password = await create_guest_access(engine, telegram_id, project_id)
+    return {**access, "password": password}
+
+
+@app.delete("/api/projects/{project_id}/guest-accesses/{access_id}", status_code=204)
+async def delete_project_guest_access(
+    request: Request, project_id: Annotated[int, Path(gt=0)], access_id: Annotated[int, Path(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> None:
+    engine: AsyncEngine = request.app.state.database_engine
+    if not await revoke_guest_access(engine, telegram_id, project_id, access_id):
+        raise HTTPException(status_code=404, detail="Гостьовий доступ не знайдено.")
 
 
 @app.get("/api/transactions", response_model=list[TransactionResponse])
