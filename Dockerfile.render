@@ -23,7 +23,9 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY app ./app
 COPY --from=frontend-builder /frontend/dist ./frontend/dist
+COPY start-render.sh ./start-render.sh
+RUN chmod +x ./start-render.sh
 
 EXPOSE 10000
 
-CMD ["sh", "-c", "uvicorn app.api:app --host 0.0.0.0 --port ${PORT:-10000}"]
+CMD ["./start-render.sh"]
