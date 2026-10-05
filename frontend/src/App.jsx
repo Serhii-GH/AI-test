@@ -21,8 +21,6 @@ const dateFormatter = new Intl.DateTimeFormat('uk-UA', {
 
 const barColors = ['#c65b3f', '#d5864c', '#8d9a70', '#556b63', '#b6a176', '#7d6656']
 const TRANSACTION_PAGE_SIZE = 10
-const TELEGRAM_BOT_USERNAME = 'my_first_131313_bot'
-const TELEGRAM_LOGIN_URL = `https://t.me/${TELEGRAM_BOT_USERNAME}?start=login`
 
 function getTodayForInput() {
   const now = new Date()
@@ -144,10 +142,10 @@ function App() {
   const [telegramId, setTelegramId] = useState(null)
   const [telegramUsername, setTelegramUsername] = useState(null)
   const [telegramAvatarUrl, setTelegramAvatarUrl] = useState(null)
-  const [telegramIdInput, setTelegramIdInput] = useState('')
-  const [loginCode, setLoginCode] = useState('')
   const [authStatus, setAuthStatus] = useState('checking')
   const [authError, setAuthError] = useState('')
+  const [telegramLogin, setTelegramLogin] = useState(null)
+  const [loginAttempt, setLoginAttempt] = useState(0)
   const [summary, setSummary] = useState(null)
   const [transactions, setTransactions] = useState([])
   const [projects, setProjects] = useState([])
@@ -273,6 +271,75 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (authStatus !== 'unauthenticated') {
+      return undefined
+    }
+
+    let isCurrent = true
+    let pollTimer = null
+
+    async function startAndPollTelegramLogin() {
+      setTelegramLogin(null)
+      setAuthError('')
+      try {
+        const response = await fetch('/api/auth/challenges', { method: 'POST' })
+        if (!response.ok) {
+          const body = await response.json().catch(() => null)
+          throw new Error(typeof body?.detail === 'string' ? body.detail : 'Не вдалося підготувати вхід через Telegram.')
+        }
+
+        const login = await response.json()
+        if (!isCurrent) {
+          return
+        }
+        setTelegramLogin(login)
+
+        async function pollChallenge() {
+          try {
+            const pollResponse = await fetch(`/api/auth/challenges/${encodeURIComponent(login.challenge)}`)
+            if (pollResponse.status === 410) {
+              throw new Error('Посилання для входу прострочене. Створіть нове.')
+            }
+            if (!pollResponse.ok) {
+              throw new Error('Не вдалося перевірити підтвердження входу.')
+            }
+            const status = await pollResponse.json()
+            if (!isCurrent) {
+              return
+            }
+            if (status.status === 'authenticated') {
+              setTelegramId(String(status.telegram_id))
+              setTelegramUsername(status.username ?? null)
+              setAuthStatus('authenticated')
+              return
+            }
+            pollTimer = window.setTimeout(() => { void pollChallenge() }, 2000)
+          } catch (requestError) {
+            if (isCurrent) {
+              setTelegramLogin(null)
+              setAuthError(requestError.message || 'Не вдалося завершити вхід через Telegram.')
+            }
+          }
+        }
+
+        void pollChallenge()
+      } catch (requestError) {
+        if (isCurrent) {
+          setAuthError(requestError.message || 'Не вдалося підготувати вхід через Telegram.')
+        }
+      }
+    }
+
+    void startAndPollTelegramLogin()
+    return () => {
+      isCurrent = false
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer)
+      }
+    }
+  }, [authStatus, loginAttempt])
+
+  useEffect(() => {
     let avatarUrl = null
     let isCurrent = true
 
@@ -337,43 +404,6 @@ function App() {
     const loadTimer = window.setTimeout(() => { void loadChatThreads() }, 0)
     return () => window.clearTimeout(loadTimer)
   }, [activeProjectId, loadChatThreads, telegramId])
-
-  async function verifyLogin(event) {
-    event.preventDefault()
-    const normalizedTelegramId = telegramIdInput.trim()
-    const normalizedCode = loginCode.trim()
-    if (!/^\d+$/.test(normalizedTelegramId) || normalizedTelegramId === '0') {
-      setAuthError('Введіть коректний Telegram ID.')
-      return
-    }
-    if (!/^\d{6}$/.test(normalizedCode)) {
-      setAuthError('Введіть 6-значний код із Telegram-бота.')
-      return
-    }
-
-    setAuthStatus('verifying')
-    setAuthError('')
-    try {
-      const response = await fetch('/api/auth/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ telegram_id: Number(normalizedTelegramId), code: normalizedCode }),
-      })
-      if (!response.ok) {
-        const body = await response.json().catch(() => null)
-        throw new Error(typeof body?.detail === 'string' ? body.detail : 'Не вдалося підтвердити код.')
-      }
-
-      const session = await response.json()
-      setTelegramId(String(session.telegram_id))
-      setTelegramUsername(session.username ?? null)
-      setLoginCode('')
-      setAuthStatus('authenticated')
-    } catch (requestError) {
-      setAuthError(requestError.message || 'Не вдалося підтвердити код. Спробуйте ще раз.')
-      setAuthStatus('unauthenticated')
-    }
-  }
 
   async function logout() {
     await fetch('/api/auth/logout', { method: 'POST' })
@@ -768,35 +798,26 @@ function App() {
               <button className="logout-button" type="button" onClick={logout}>Вийти</button>
             </>
           ) : (
-            <form className="telegram-form login-form" onSubmit={verifyLogin}>
-              <a className="telegram-login-link" href={TELEGRAM_LOGIN_URL} target="_blank" rel="noreferrer">
-                <span>Відкрити Telegram-бота</span>
-                <strong>@{TELEGRAM_BOT_USERNAME}</strong>
-              </a>
-              <p className="telegram-login-help">Бот одразу надішле ваш Telegram ID і одноразовий код для входу.</p>
-              <label htmlFor="telegram-id">Telegram ID</label>
-              <input
-                id="telegram-id"
-                inputMode="numeric"
-                value={telegramIdInput}
-                onChange={(event) => setTelegramIdInput(event.target.value)}
-                placeholder="Із повідомлення бота"
-                disabled={authStatus === 'checking' || authStatus === 'verifying'}
-              />
-              <label htmlFor="login-code">Код із бота</label>
-              <input
-                id="login-code"
-                inputMode="numeric"
-                maxLength="6"
-                value={loginCode}
-                onChange={(event) => setLoginCode(event.target.value.replace(/\D/g, ''))}
-                placeholder="000000"
-                disabled={authStatus === 'checking' || authStatus === 'verifying'}
-              />
-              <button type="submit" disabled={authStatus === 'checking' || authStatus === 'verifying'}>
-                {authStatus === 'verifying' ? 'Перевіряємо…' : 'Увійти'}
+            <div className="telegram-form login-form">
+              {telegramLogin ? (
+                <a className="telegram-login-link" href={telegramLogin.telegram_url} target="_blank" rel="noreferrer">
+                  <span>Відкрити Telegram-бота</span>
+                  <strong>@{telegramLogin.bot_username}</strong>
+                </a>
+              ) : (
+                <span className="telegram-login-link telegram-login-link-loading">
+                  {authError ? 'Не вдалося створити посилання' : 'Готуємо захищене посилання…'}
+                </span>
+              )}
+              <p className="telegram-login-help">Відкрийте бота та підтвердьте вхід. Сайт увійде автоматично — Telegram ID і код не потрібні.</p>
+              <button
+                type="button"
+                onClick={() => setLoginAttempt((attempt) => attempt + 1)}
+                disabled={authStatus === 'checking'}
+              >
+                Створити нове посилання
               </button>
-            </form>
+            </div>
           )}
         </div>
       </header>
@@ -846,7 +867,7 @@ function App() {
       {authStatus === 'unauthenticated' && (
         <section className="message-card bind-card">
           <h2>Увійдіть через Telegram</h2>
-          <p>Натисніть «Відкрити Telegram-бота» вище. Бот <code>@{TELEGRAM_BOT_USERNAME}</code> надішле ваш Telegram ID і одноразовий 6-значний код, який дійсний 5 хвилин.</p>
+          <p>Натисніть «Відкрити Telegram-бота» вище та підтвердьте вхід у боті. Сторінка отримає сесію автоматично; посилання діє 5 хвилин і лише для цього браузера.</p>
           {authError && <p className="transaction-form-error" role="alert">{authError}</p>}
         </section>
       )}

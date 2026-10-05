@@ -110,6 +110,23 @@ web_login_codes = Table(
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 
+web_login_challenges = Table(
+    "web_login_challenges",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("challenge_hash", String(64), nullable=False, unique=True),
+    Column("telegram_id", BigInteger, index=True),
+    Column("status", String(16), nullable=False, server_default="pending"),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("approved_at", DateTime(timezone=True)),
+    Column("consumed_at", DateTime(timezone=True)),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    CheckConstraint(
+        "status IN ('pending', 'approved', 'consumed')",
+        name="ck_web_login_challenges_status",
+    ),
+)
+
 web_sessions = Table(
     "web_sessions",
     metadata,
@@ -733,6 +750,77 @@ async def verify_web_login_code(engine: AsyncEngine, telegram_id: int, code: str
             .values(attempts=login_code["attempts"] + 1)
         )
         return False
+
+
+async def create_web_login_challenge(engine: AsyncEngine) -> str:
+    """Create a short-lived browser challenge for Telegram login."""
+    challenge = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as connection:
+        await connection.execute(
+            delete(web_login_challenges).where(web_login_challenges.c.expires_at <= now)
+        )
+        await connection.execute(
+            insert(web_login_challenges).values(
+                challenge_hash=_hash_auth_value(challenge),
+                expires_at=now + timedelta(minutes=5),
+            )
+        )
+    return challenge
+
+
+async def approve_web_login_challenge(
+    engine: AsyncEngine,
+    challenge: str,
+    telegram_id: int,
+) -> bool:
+    """Bind one pending browser challenge to the Telegram user who opened it."""
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            update(web_login_challenges)
+            .where(
+                web_login_challenges.c.challenge_hash == _hash_auth_value(challenge),
+                web_login_challenges.c.status == "pending",
+                web_login_challenges.c.expires_at > now,
+            )
+            .values(
+                telegram_id=telegram_id,
+                status="approved",
+                approved_at=now,
+            )
+        )
+        return result.rowcount == 1
+
+
+async def consume_web_login_challenge(
+    engine: AsyncEngine,
+    challenge: str,
+) -> tuple[str, int | None]:
+    """Return a browser challenge state and consume it atomically once approved."""
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as connection:
+        result = await connection.execute(
+            select(web_login_challenges)
+            .where(web_login_challenges.c.challenge_hash == _hash_auth_value(challenge))
+            .with_for_update()
+        )
+        login_challenge = result.mappings().one_or_none()
+        if (
+            login_challenge is None
+            or login_challenge["expires_at"] <= now
+            or login_challenge["status"] == "consumed"
+        ):
+            return "expired", None
+        if login_challenge["status"] == "pending":
+            return "pending", None
+
+        await connection.execute(
+            update(web_login_challenges)
+            .where(web_login_challenges.c.id == login_challenge["id"])
+            .values(status="consumed", consumed_at=now)
+        )
+        return "approved", int(login_challenge["telegram_id"])
 
 
 async def create_web_session(engine: AsyncEngine, telegram_id: int) -> str:

@@ -10,6 +10,8 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: TELEGRAM_BOT_USERNAME
+        value: my_first_131313_bot
       - key: DATABASE_URL
         sync: false
       - key: GEMINI_API_KEY

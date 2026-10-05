@@ -30,12 +30,14 @@ from app.ai_chat import (
 from app.database import (
     check_database_connection,
     create_ai_chat_thread,
+    create_web_login_challenge,
     create_user_project,
     create_web_session,
     create_database_engine,
     claim_pending_ai_action,
     confirm_pending_create_transaction_action,
     consume_api_rate_limit,
+    consume_web_login_challenge,
     delete_ai_chat_threads,
     delete_web_session,
     get_ai_chat_thread,
@@ -136,6 +138,19 @@ class SessionResponse(BaseModel):
     username: str | None
 
 
+class LoginChallengeResponse(BaseModel):
+    challenge: str
+    telegram_url: str
+    bot_username: str
+    expires_in_seconds: int
+
+
+class LoginChallengeStatusResponse(BaseModel):
+    status: Literal["pending", "authenticated"]
+    telegram_id: int | None = None
+    username: str | None = None
+
+
 class ChatRequest(BaseModel):
     message: Annotated[str, Field(min_length=1, max_length=2_000)]
     project_id: Annotated[int, Field(gt=0)]
@@ -173,6 +188,9 @@ SESSION_DURATION_SECONDS = 7 * 24 * 60 * 60
 CHAT_RETENTION = timedelta(days=7)
 AUTH_VERIFY_LIMIT = 10
 AUTH_VERIFY_WINDOW = timedelta(minutes=10)
+AUTH_CHALLENGE_LIMIT = 10
+AUTH_CHALLENGE_WINDOW = timedelta(minutes=10)
+LOGIN_CHALLENGE_DURATION_SECONDS = 5 * 60
 CHAT_REQUEST_LIMIT = 10
 CHAT_REQUEST_WINDOW = timedelta(minutes=1)
 ANALYSIS_REQUEST_LIMIT = 5
@@ -181,6 +199,26 @@ ANALYSIS_REQUEST_WINDOW = timedelta(minutes=10)
 
 def session_cookie_secure() -> bool:
     return os.getenv("SESSION_COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def telegram_bot_username() -> str:
+    return os.getenv("TELEGRAM_BOT_USERNAME", "my_first_131313_bot").strip().lstrip("@")
+
+
+def telegram_login_url(challenge: str) -> str:
+    """Build the bot deep link without exposing a bot token to the browser."""
+    return f"https://t.me/{telegram_bot_username()}?start=login_{challenge}"
+
+
+def set_session_cookie(response: Response, session_token: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        max_age=SESSION_DURATION_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=session_cookie_secure(),
+    )
 
 
 async def enforce_rate_limit(
@@ -286,6 +324,63 @@ def sse_event(event: str, payload: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+@app.post("/api/auth/challenges", response_model=LoginChallengeResponse)
+async def create_login_challenge(
+    request: Request,
+    response: Response,
+) -> dict[str, object]:
+    """Create a one-time browser challenge and its Telegram bot deep link."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await enforce_rate_limit(
+        engine,
+        scope="auth_challenge_ip",
+        subject=request_client_ip(request),
+        limit=AUTH_CHALLENGE_LIMIT,
+        window=AUTH_CHALLENGE_WINDOW,
+    )
+    challenge = await create_web_login_challenge(engine)
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "challenge": challenge,
+        "telegram_url": telegram_login_url(challenge),
+        "bot_username": telegram_bot_username(),
+        "expires_in_seconds": LOGIN_CHALLENGE_DURATION_SECONDS,
+    }
+
+
+@app.get(
+    "/api/auth/challenges/{challenge}",
+    response_model=LoginChallengeStatusResponse,
+)
+async def poll_login_challenge(
+    request: Request,
+    response: Response,
+    challenge: Annotated[
+        str,
+        Path(min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]+$"),
+    ],
+) -> dict[str, object]:
+    """Poll the browser challenge and create its session after bot approval."""
+    engine: AsyncEngine = request.app.state.database_engine
+    state, telegram_id = await consume_web_login_challenge(engine, challenge)
+    response.headers["Cache-Control"] = "no-store"
+    if state == "expired":
+        raise HTTPException(status_code=410, detail="Посилання для входу прострочене. Створіть нове.")
+    if state == "pending":
+        return {"status": "pending"}
+    if telegram_id is None:
+        raise HTTPException(status_code=410, detail="Посилання для входу недійсне. Створіть нове.")
+
+    session_token = await create_web_session(engine, telegram_id)
+    set_session_cookie(response, session_token)
+    profile = await get_telegram_user_profile(engine, telegram_id)
+    return {
+        "status": "authenticated",
+        "telegram_id": telegram_id,
+        "username": profile.get("username") if profile else None,
+    }
+
+
 @app.post("/api/auth/verify", response_model=SessionResponse)
 async def verify_login(
     request: Request,
@@ -313,14 +408,7 @@ async def verify_login(
         raise HTTPException(status_code=401, detail="Код недійсний, прострочений або вже використаний.")
 
     session_token = await create_web_session(engine, credentials.telegram_id)
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_token,
-        max_age=SESSION_DURATION_SECONDS,
-        httponly=True,
-        samesite="lax",
-        secure=session_cookie_secure(),
-    )
+    set_session_cookie(response, session_token)
     profile = await get_telegram_user_profile(engine, credentials.telegram_id)
     return {"telegram_id": credentials.telegram_id, "username": profile.get("username") if profile else None}
 

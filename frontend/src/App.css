@@ -89,6 +89,17 @@
   box-shadow: 0 8px 18px rgba(15, 21, 18, 0.22);
 }
 
+.telegram-login-link-loading {
+  color: #c2bdaf;
+  cursor: wait;
+}
+
+.telegram-login-link-loading:hover {
+  transform: none;
+  background: rgba(55, 135, 180, 0.2);
+  box-shadow: none;
+}
+
 .telegram-login-help {
   grid-column: 1 / -1;
   margin: 2px 0 5px;
@@ -135,10 +146,11 @@
 }
 
 .telegram-form button {
+  grid-column: 1 / -1;
   background: #e4b16e;
   color: #2a312c;
   font-size: 0.77rem;
-  padding: 0 12px;
+  padding: 10px 12px;
 }
 
 .telegram-form button:hover,
