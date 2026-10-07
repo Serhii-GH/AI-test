@@ -38,7 +38,7 @@ from app.database import (
     create_guest_session,
     create_database_engine,
     claim_pending_ai_action,
-    confirm_pending_create_transaction_action,
+    confirm_pending_ai_action,
     consume_api_rate_limit,
     consume_web_login_challenge,
     delete_ai_chat_threads,
@@ -64,6 +64,7 @@ from app.database import (
     delete_user_transaction,
     save_transaction,
     save_ai_chat_memory_summary,
+    update_user_transaction,
     revoke_guest_access,
     touch_ai_chat_thread,
     verify_web_login_code,
@@ -102,6 +103,7 @@ class TransactionResponse(BaseModel):
 class FinancialSummaryResponse(BaseModel):
     total_income: Decimal
     total_expense: Decimal
+    total_expense_usd: Decimal
     balance: Decimal
 
 
@@ -133,6 +135,10 @@ class CreateProjectRequest(BaseModel):
 
 class CreateTransactionRequest(TransactionActionPayload):
     project_id: Annotated[int, Field(gt=0)]
+
+
+class UpdateTransactionRequest(TransactionActionPayload):
+    pass
 
 
 class VerifyLoginRequest(BaseModel):
@@ -707,6 +713,29 @@ async def create_transaction(
     )
 
 
+@app.put("/api/transactions/{transaction_id}", response_model=TransactionResponse)
+async def update_transaction(
+    request: Request,
+    transaction_id: Annotated[int, Path(gt=0)],
+    transaction: UpdateTransactionRequest,
+    project_id: Annotated[int, Query(gt=0)],
+    telegram_id: Annotated[int, Depends(require_authenticated_telegram_id)],
+) -> dict[str, object]:
+    """Replace one transaction only when it belongs to the authenticated user."""
+    engine: AsyncEngine = request.app.state.database_engine
+    await require_user_project(engine, telegram_id, project_id)
+    updated = await update_user_transaction(
+        engine,
+        telegram_id=telegram_id,
+        project_id=project_id,
+        transaction_id=transaction_id,
+        payload=transaction,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Операцію не знайдено.")
+    return updated
+
+
 @app.delete("/api/transactions/{transaction_id}", status_code=204)
 async def delete_transaction(
     request: Request,
@@ -809,7 +838,7 @@ async def confirm_ai_action(
     engine: AsyncEngine = request.app.state.database_engine
     await require_user_project(engine, telegram_id, project_id)
     try:
-        action, created_transaction, replayed = await confirm_pending_create_transaction_action(
+        action, changed_transaction, replayed = await confirm_pending_ai_action(
             engine=engine,
             telegram_id=telegram_id,
             project_id=project_id,
@@ -821,7 +850,7 @@ async def confirm_ai_action(
 
     if action is not None and action.get("status") == "failed":
         raise HTTPException(status_code=422, detail="Чернетка дії не пройшла перевірку.")
-    if action is None or created_transaction is None:
+    if action is None or action.get("status") != "confirmed":
         raise HTTPException(
             status_code=409,
             detail="Дію неможливо підтвердити: вона не існує, вже оброблена або прострочена.",
@@ -830,7 +859,11 @@ async def confirm_ai_action(
         logger.info("idempotent AI action confirmation replayed for %s", action_id)
     return ActionExecutionResponse(
         action=pending_action_response(action),
-        transaction=TransactionResponse.model_validate(created_transaction),
+        transaction=(
+            TransactionResponse.model_validate(changed_transaction)
+            if changed_transaction is not None
+            else None
+        ),
     )
 
 

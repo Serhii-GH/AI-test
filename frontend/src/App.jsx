@@ -40,6 +40,18 @@ function createEmptyTransactionForm() {
   }
 }
 
+function transactionToForm(transaction) {
+  return {
+    type: transaction.transaction_type,
+    amount: String(transaction.amount ?? ''),
+    exchange_rate: String(transaction.exchange_rate ?? ''),
+    category: transaction.main_category === 'Роботи' ? 'Роботи' : 'Матеріали',
+    subcategory: transaction.subcategory ?? '',
+    description: transaction.description ?? '',
+    date: String(transaction.created_at ?? '').slice(0, 10),
+  }
+}
+
 function formatCurrency(value) {
   return currencyFormatter.format(Number(value ?? 0))
 }
@@ -54,6 +66,70 @@ function formatExchangeRate(value) {
 
 function formatDate(value) {
   return value ? dateFormatter.format(new Date(value)) : '—'
+}
+
+function ActionTransactionDetails({ title, transaction }) {
+  if (!transaction) return null
+
+  return (
+    <section className="pending-action-transaction-details">
+      <h4>{title}</h4>
+      <dl className="pending-action-details">
+        <div><dt>Сума</dt><dd>{formatCurrency(transaction.amount)}</dd></div>
+        <div><dt>Категорія</dt><dd>{transaction.category} → {transaction.subcategory}</dd></div>
+        <div><dt>Дата</dt><dd>{formatDate(transaction.date)}</dd></div>
+        <div><dt>Курс USD</dt><dd>{formatExchangeRate(transaction.exchange_rate)} грн/$</dd></div>
+        <div className="pending-action-description"><dt>Опис</dt><dd>{transaction.description}</dd></div>
+      </dl>
+    </section>
+  )
+}
+
+function PendingActionCard({ action, onResolve, isResolving, isChatSending }) {
+  const isCreate = action.action_type === 'create_transaction'
+  const isUpdate = action.action_type === 'update_transaction'
+  const isDelete = action.action_type === 'delete_transaction'
+  const title = isCreate
+    ? (action.payload.type === 'expense' ? 'Створити витрату' : 'Створити дохід')
+    : isUpdate
+      ? 'Змінити операцію'
+      : 'Видалити операцію'
+
+  return (
+    <article className={`pending-action-card ${isDelete ? 'pending-action-card-danger' : ''}`}>
+      <div className="pending-action-heading">
+        <div>
+          <p className="panel-kicker">Запропонована дія</p>
+          <h3>{title}</h3>
+        </div>
+        <span className="pending-action-status">Потрібне підтвердження</span>
+      </div>
+      {isCreate && <ActionTransactionDetails title="Нова операція" transaction={action.payload} />}
+      {isUpdate && <>
+        <ActionTransactionDetails title="Було" transaction={action.payload.expected} />
+        <ActionTransactionDetails title="Стане" transaction={action.payload} />
+      </>}
+      {isDelete && <ActionTransactionDetails title="Буде видалено" transaction={action.payload.expected} />}
+      <div className="pending-action-buttons">
+        <button
+          className="confirm-action-button"
+          type="button"
+          onClick={() => { void onResolve(action.id, 'confirm') }}
+          disabled={Boolean(isResolving) || isChatSending}
+        >
+          {isResolving === action.id ? 'Обробляємо…' : 'Підтвердити'}
+        </button>
+        <button
+          className="cancel-action-button"
+          type="button"
+          onClick={() => { void onResolve(action.id, 'cancel') }}
+          disabled={Boolean(isResolving) || isChatSending}
+        >
+          Скасувати
+        </button>
+      </div>
+    </article>
+  )
 }
 
 function sortTotals(totals) {
@@ -167,7 +243,7 @@ function GuestDashboard({ session, onLogout }) {
       {data && <>
         <section className="summary-grid">
           <article className="summary-card income-card"><span className="card-label">Загальний дохід</span><strong>{formatCurrency(data.summary.total_income)}</strong></article>
-          <article className="summary-card expense-card"><span className="card-label">Загальні витрати</span><strong>{formatCurrency(data.summary.total_expense)}</strong></article>
+          <article className="summary-card expense-card"><span className="card-label">Загальні витрати</span><strong>{formatCurrency(data.summary.total_expense)}</strong><span className="summary-usd-total">{formatUsd(data.summary.total_expense_usd)}</span></article>
           <article className="summary-card balance-card"><span className="card-label">Поточний баланс</span><strong>{formatCurrency(data.summary.balance)}</strong></article>
         </section>
         <section className="panel transaction-list"><h2>Операції</h2>{data.transactions.map((item) => <div className="transaction-row" key={item.id}><span>{formatDate(item.created_at)} · {item.main_category} · {item.subcategory}<small>{item.description}</small></span><strong>{formatCurrency(item.amount)}</strong></div>)}</section>
@@ -209,6 +285,9 @@ function App() {
   const [isSubmittingTransaction, setIsSubmittingTransaction] = useState(false)
   const [transactionActionError, setTransactionActionError] = useState('')
   const [deletingTransactionId, setDeletingTransactionId] = useState(null)
+  const [editingTransaction, setEditingTransaction] = useState(null)
+  const [editTransactionForm, setEditTransactionForm] = useState(createEmptyTransactionForm)
+  const [isSavingTransactionEdit, setIsSavingTransactionEdit] = useState(false)
   const [transactionFilter, setTransactionFilter] = useState('all')
   const [visibleTransactionLimit, setVisibleTransactionLimit] = useState(TRANSACTION_PAGE_SIZE)
   const [analysis, setAnalysis] = useState(null)
@@ -733,6 +812,54 @@ function App() {
     }
   }
 
+  function startEditingTransaction(transaction) {
+    setEditingTransaction(transaction)
+    setEditTransactionForm(transactionToForm(transaction))
+    setTransactionActionError('')
+  }
+
+  function updateEditTransactionForm(event) {
+    const { name, value } = event.target
+    setEditTransactionForm((current) => ({ ...current, [name]: value }))
+  }
+
+  async function submitTransactionEdit(event) {
+    event.preventDefault()
+    if (!editingTransaction || !activeProjectId) return
+
+    setIsSavingTransactionEdit(true)
+    setTransactionActionError('')
+    try {
+      const response = await fetch(
+        `/api/transactions/${editingTransaction.id}?project_id=${activeProjectId}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...editTransactionForm,
+            amount: editTransactionForm.amount.trim(),
+            exchange_rate: editTransactionForm.exchange_rate.trim(),
+            category: editTransactionForm.category.trim(),
+            subcategory: editTransactionForm.subcategory.trim(),
+            description: editTransactionForm.description.trim(),
+          }),
+        },
+      )
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(typeof body?.detail === 'string' ? body.detail : 'Не вдалося зберегти зміни операції.')
+      }
+      setEditingTransaction(null)
+      setAnalysis(null)
+      setAnalysisStatus('idle')
+      await loadDashboard()
+    } catch (requestError) {
+      setTransactionActionError(requestError.message || 'Не вдалося зберегти зміни операції. Спробуйте ще раз.')
+    } finally {
+      setIsSavingTransactionEdit(false)
+    }
+  }
+
   async function runAiAnalysis() {
     if (!telegramId || !activeProjectId) {
       return
@@ -1076,7 +1203,8 @@ function App() {
             <article className="summary-card expense-card">
               <span className="card-label">Загальні витрати</span>
               <strong>{isLoading ? '—' : formatCurrency(summary?.total_expense)}</strong>
-              <span className="card-note">Витрати на ремонт</span>
+              <span className="summary-usd-total">{isLoading ? '—' : formatUsd(summary?.total_expense_usd)}</span>
+              <span className="card-note">Витрати на ремонт у гривнях і доларах</span>
             </article>
             <article className="summary-card balance-card">
               <span className="card-label">Поточний баланс</span>
@@ -1133,40 +1261,13 @@ function App() {
             {pendingActions.length > 0 && (
               <section className="pending-actions" aria-label="Запропоновані AI-дії">
                 {pendingActions.map((action) => (
-                  <article className="pending-action-card" key={action.id}>
-                    <div className="pending-action-heading">
-                      <div>
-                        <p className="panel-kicker">Запропонована дія</p>
-                        <h3>{action.payload.type === 'expense' ? 'Створити витрату' : 'Створити дохід'}</h3>
-                      </div>
-                      <span className="pending-action-status">Потрібне підтвердження</span>
-                    </div>
-                    <dl className="pending-action-details">
-                      <div><dt>Сума</dt><dd>{formatCurrency(action.payload.amount)}</dd></div>
-                      <div><dt>Категорія</dt><dd>{action.payload.category} → {action.payload.subcategory}</dd></div>
-                      <div><dt>Дата</dt><dd>{formatDate(action.payload.date)}</dd></div>
-                      <div><dt>Курс USD</dt><dd>{formatExchangeRate(action.payload.exchange_rate)} грн/$</dd></div>
-                      <div className="pending-action-description"><dt>Опис</dt><dd>{action.payload.description}</dd></div>
-                    </dl>
-                    <div className="pending-action-buttons">
-                      <button
-                        className="confirm-action-button"
-                        type="button"
-                        onClick={() => { void resolvePendingAction(action.id, 'confirm') }}
-                        disabled={Boolean(resolvingActionId) || chatStatus === 'sending'}
-                      >
-                        {resolvingActionId === action.id ? 'Обробляємо…' : 'Підтвердити'}
-                      </button>
-                      <button
-                        className="cancel-action-button"
-                        type="button"
-                        onClick={() => { void resolvePendingAction(action.id, 'cancel') }}
-                        disabled={Boolean(resolvingActionId) || chatStatus === 'sending'}
-                      >
-                        Скасувати
-                      </button>
-                    </div>
-                  </article>
+                  <PendingActionCard
+                    action={action}
+                    isChatSending={chatStatus === 'sending'}
+                    isResolving={resolvingActionId}
+                    key={action.id}
+                    onResolve={resolvePendingAction}
+                  />
                 ))}
               </section>
             )}
@@ -1304,6 +1405,64 @@ function App() {
         {transactionError && <p className="transaction-form-error" role="alert">{transactionError}</p>}
       </section>
 
+      {editingTransaction && (
+        <section className="panel transaction-form-panel edit-transaction-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="panel-kicker">Редагування операції</p>
+              <h2>Змініть дані та збережіть</h2>
+            </div>
+            <button
+              className="cancel-action-button"
+              type="button"
+              onClick={() => setEditingTransaction(null)}
+              disabled={isSavingTransactionEdit}
+            >
+              Скасувати
+            </button>
+          </div>
+          <form className="transaction-form" onSubmit={submitTransactionEdit}>
+            <label>
+              Тип
+              <select name="type" value={editTransactionForm.type} onChange={updateEditTransactionForm}>
+                <option value="expense">Витрата</option>
+                <option value="income">Дохід</option>
+              </select>
+            </label>
+            <label>
+              Сума, грн
+              <input name="amount" type="number" min="0.01" step="0.01" value={editTransactionForm.amount} onChange={updateEditTransactionForm} required />
+            </label>
+            <label>
+              Курс USD, грн
+              <input name="exchange_rate" type="number" min="0.0001" step="0.0001" value={editTransactionForm.exchange_rate} onChange={updateEditTransactionForm} required />
+            </label>
+            <label>
+              Категорія
+              <select name="category" value={editTransactionForm.category} onChange={updateEditTransactionForm}>
+                <option value="Роботи">Роботи</option>
+                <option value="Матеріали">Матеріали</option>
+              </select>
+            </label>
+            <label>
+              Підкатегорія
+              <input name="subcategory" maxLength="100" value={editTransactionForm.subcategory} onChange={updateEditTransactionForm} required />
+            </label>
+            <label>
+              Позиція
+              <input name="description" maxLength="255" value={editTransactionForm.description} onChange={updateEditTransactionForm} required />
+            </label>
+            <label>
+              Дата
+              <input name="date" type="date" value={editTransactionForm.date} onChange={updateEditTransactionForm} required />
+            </label>
+            <button className="submit-transaction-button" type="submit" disabled={isSavingTransactionEdit}>
+              {isSavingTransactionEdit ? 'Зберігаємо…' : 'Зберегти зміни'}
+            </button>
+          </form>
+        </section>
+      )}
+
       <section className="content-grid">
         <section className="panel chart-panel">
           <div className="panel-heading">
@@ -1411,6 +1570,14 @@ function App() {
                               </>}
                             </td>
                             <td className="transaction-action-cell">
+                              <button
+                                className="edit-transaction-button"
+                                type="button"
+                                onClick={() => startEditingTransaction(transaction)}
+                                disabled={isSavingTransactionEdit || deletingTransactionId === transaction.id}
+                              >
+                                Редагувати
+                              </button>
                               <button
                                 className="delete-transaction-button"
                                 type="button"
