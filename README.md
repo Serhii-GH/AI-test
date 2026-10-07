@@ -4,6 +4,26 @@
 
 The application is deployed on Render. See [production deployment](docs/deploy.md) for the public URL, deployment settings, environment variables and verification checklist. DNS and custom-domain details are in [domain setup](docs/domain.md).
 
+## Безпечний процес змін
+
+Кожна зміна, що може потрапити у production, проходить однаковий шлях:
+
+```text
+окрема branch -> маленькі зміни -> git diff -> preflight -> Pull Request -> GitHub Actions CI -> merge -> Render deploy -> smoke test
+```
+
+Перед commit і push запусти shared preflight з кореня репозиторію:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\preflight.py
+```
+
+`PREFLIGHT PASSED` означає, що перевірки backend, tests, React production build, `Dockerfile.render`, required production files і `.env` Git-check пройшли. Якщо preflight або CI не пройшли, не роби merge: виправ проблему й запусти перевірки повторно.
+
+- [AGENTS.md](AGENTS.md) — постійні правила для AI-агентів.
+- [Production operations](docs/production-operations.md) — release, smoke test, `git revert`, emergency Render rollback і правила для database changes.
+- [Production deployment](docs/deploy.md) — Render settings, environment variables та deployment verification.
+
 ## API для майбутнього веб-інтерфейсу
 
 Бекенд надає endpoint `GET /api/transactions`. Він читає транзакції з PostgreSQL
