@@ -77,6 +77,19 @@ Commit only `.env.example` with placeholder values. When adding a required envir
 - Application-code rollback does not roll back Neon PostgreSQL data or schema. For database-affecting changes, document the forward migration, compatibility plan, backup/recovery approach, and rollback plan before deployment. Do not run destructive database commands without explicit approval.
 - Follow the detailed incident procedure in `docs/production-operations.md`.
 
+## Change impact and scope
+
+- Before changing an API contract, database access, authentication, AI behavior, or deployment configuration, identify affected frontend, backend, and production components. Keep frontend and backend changes compatible during rollout.
+- Treat database changes as production changes. Prefer backward-compatible, forward-only migrations; do not run destructive SQL or modify production data without explicit approval and a documented recovery plan.
+- Keep each task focused. Do not refactor unrelated code, change deployment configuration, or update dependencies "while here" unless the task explicitly requires it.
+- When a change alters user-facing behavior, API contracts, environment variables, local commands, deployment, CI, or recovery procedures, update the relevant `README.md` or `docs/` file in the same Pull Request.
+
+## Definition of done
+
+- A local code task is complete only after the required changes, `git diff` review, and successful `python scripts/preflight.py` run.
+- A production change is complete only after the Pull Request, required GitHub Actions checks, merge, Render deployment, and relevant smoke test succeed.
+- State any check that was not run, why it was unavailable, and the exact follow-up command or manual verification needed.
+
 ## Required preflight before completing a task
 
 1. Run the shared preflight command: `python scripts/preflight.py`. It is the source of truth for local checks and must also be run by GitHub Actions; do not replace it with a different CI-only set of checks.
