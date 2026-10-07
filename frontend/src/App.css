@@ -973,7 +973,31 @@ h2 {
 .delete-transaction-button:hover:not(:disabled) { background: rgba(198, 91, 63, 0.3); }
 .edit-transaction-button:disabled,
 .delete-transaction-button:disabled { cursor: wait; opacity: 0.62; }
-.edit-transaction-panel { margin-bottom: 20px; }
+
+.inline-editor-row > td {
+  padding: 0 14px 16px !important;
+  background: rgba(228, 177, 110, 0.055);
+}
+
+.inline-transaction-form {
+  grid-template-columns: 0.75fr 0.8fr 0.8fr 0.9fr 1fr 1.45fr 0.9fr auto;
+  margin-top: 4px;
+  padding: 17px;
+  border: 1px solid rgba(228, 177, 110, 0.32);
+  border-radius: 10px;
+  background: rgba(10, 15, 11, 0.52);
+}
+
+.inline-transaction-form-heading {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.inline-transaction-form-heading .panel-kicker { margin: 0; }
+.inline-transaction-form-heading h3 { margin: 4px 0 0; color: #f0eadc; font-size: 0.96rem; }
 
 .empty-state,
 .chart-placeholder,
@@ -1174,6 +1198,7 @@ h2 {
   .ai-analysis-results { grid-template-columns: 1fr; }
   .project-switcher { grid-template-columns: 1fr; }
   .transaction-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .inline-transaction-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .submit-transaction-button { min-height: 43px; }
   .summary-card { min-height: 132px; }
 }
@@ -1183,6 +1208,7 @@ h2 {
   .dashboard-header { padding: 25px 21px; border-radius: 20px; }
   .panel, .summary-card, .message-card { padding: 21px; }
   .transaction-form { grid-template-columns: 1fr; }
+  .inline-transaction-form { grid-template-columns: 1fr; }
   .distribution-grid { grid-template-columns: minmax(0, 1fr); }
   .transaction-table-wrapper { margin-right: 0; margin-left: 0; padding-right: 0; padding-left: 0; }
   .bar-chart { gap: 7px; }
