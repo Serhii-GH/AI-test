@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 const currencyFormatter = new Intl.NumberFormat('uk-UA', {
@@ -129,6 +129,57 @@ function PendingActionCard({ action, onResolve, isResolving, isChatSending }) {
         </button>
       </div>
     </article>
+  )
+}
+
+function InlineTransactionEditor({ form, isSaving, onCancel, onChange, onSubmit }) {
+  return (
+    <form className="transaction-form inline-transaction-form" onSubmit={onSubmit}>
+      <div className="inline-transaction-form-heading">
+        <div>
+          <p className="panel-kicker">Редагування операції</p>
+          <h3>Змініть дані та збережіть</h3>
+        </div>
+        <button className="cancel-action-button" type="button" onClick={onCancel} disabled={isSaving}>Скасувати</button>
+      </div>
+      <label>
+        Тип
+        <select name="type" value={form.type} onChange={onChange}>
+          <option value="expense">Витрата</option>
+          <option value="income">Дохід</option>
+        </select>
+      </label>
+      <label>
+        Сума, грн
+        <input name="amount" type="number" min="0.01" step="0.01" value={form.amount} onChange={onChange} required />
+      </label>
+      <label>
+        Курс USD, грн
+        <input name="exchange_rate" type="number" min="0.0001" step="0.0001" value={form.exchange_rate} onChange={onChange} required />
+      </label>
+      <label>
+        Категорія
+        <select name="category" value={form.category} onChange={onChange}>
+          <option value="Роботи">Роботи</option>
+          <option value="Матеріали">Матеріали</option>
+        </select>
+      </label>
+      <label>
+        Підкатегорія
+        <input name="subcategory" maxLength="100" value={form.subcategory} onChange={onChange} required />
+      </label>
+      <label>
+        Позиція
+        <input name="description" maxLength="255" value={form.description} onChange={onChange} required />
+      </label>
+      <label>
+        Дата
+        <input name="date" type="date" value={form.date} onChange={onChange} required />
+      </label>
+      <button className="submit-transaction-button" type="submit" disabled={isSaving}>
+        {isSaving ? 'Зберігаємо…' : 'Зберегти зміни'}
+      </button>
+    </form>
   )
 }
 
@@ -1405,64 +1456,6 @@ function App() {
         {transactionError && <p className="transaction-form-error" role="alert">{transactionError}</p>}
       </section>
 
-      {editingTransaction && (
-        <section className="panel transaction-form-panel edit-transaction-panel">
-          <div className="panel-heading">
-            <div>
-              <p className="panel-kicker">Редагування операції</p>
-              <h2>Змініть дані та збережіть</h2>
-            </div>
-            <button
-              className="cancel-action-button"
-              type="button"
-              onClick={() => setEditingTransaction(null)}
-              disabled={isSavingTransactionEdit}
-            >
-              Скасувати
-            </button>
-          </div>
-          <form className="transaction-form" onSubmit={submitTransactionEdit}>
-            <label>
-              Тип
-              <select name="type" value={editTransactionForm.type} onChange={updateEditTransactionForm}>
-                <option value="expense">Витрата</option>
-                <option value="income">Дохід</option>
-              </select>
-            </label>
-            <label>
-              Сума, грн
-              <input name="amount" type="number" min="0.01" step="0.01" value={editTransactionForm.amount} onChange={updateEditTransactionForm} required />
-            </label>
-            <label>
-              Курс USD, грн
-              <input name="exchange_rate" type="number" min="0.0001" step="0.0001" value={editTransactionForm.exchange_rate} onChange={updateEditTransactionForm} required />
-            </label>
-            <label>
-              Категорія
-              <select name="category" value={editTransactionForm.category} onChange={updateEditTransactionForm}>
-                <option value="Роботи">Роботи</option>
-                <option value="Матеріали">Матеріали</option>
-              </select>
-            </label>
-            <label>
-              Підкатегорія
-              <input name="subcategory" maxLength="100" value={editTransactionForm.subcategory} onChange={updateEditTransactionForm} required />
-            </label>
-            <label>
-              Позиція
-              <input name="description" maxLength="255" value={editTransactionForm.description} onChange={updateEditTransactionForm} required />
-            </label>
-            <label>
-              Дата
-              <input name="date" type="date" value={editTransactionForm.date} onChange={updateEditTransactionForm} required />
-            </label>
-            <button className="submit-transaction-button" type="submit" disabled={isSavingTransactionEdit}>
-              {isSavingTransactionEdit ? 'Зберігаємо…' : 'Зберегти зміни'}
-            </button>
-          </form>
-        </section>
-      )}
-
       <section className="content-grid">
         <section className="panel chart-panel">
           <div className="panel-heading">
@@ -1550,7 +1543,8 @@ function App() {
                         const isIncome = transaction.transaction_type === 'income'
 
                         return (
-                          <tr key={transaction.id}>
+                          <Fragment key={transaction.id}>
+                          <tr>
                             <td className="date-cell">{formatDate(transaction.created_at)}</td>
                             <td>
                               <span className={isIncome ? 'type-pill income-pill' : 'type-pill expense-pill'}>
@@ -1588,6 +1582,20 @@ function App() {
                               </button>
                             </td>
                           </tr>
+                          {editingTransaction?.id === transaction.id && (
+                            <tr className="inline-editor-row">
+                              <td colSpan="8">
+                                <InlineTransactionEditor
+                                  form={editTransactionForm}
+                                  isSaving={isSavingTransactionEdit}
+                                  onCancel={() => setEditingTransaction(null)}
+                                  onChange={updateEditTransactionForm}
+                                  onSubmit={submitTransactionEdit}
+                                />
+                              </td>
+                            </tr>
+                          )}
+                          </Fragment>
                         )
                       })}
                     </tbody>
