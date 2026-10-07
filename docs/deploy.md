@@ -4,6 +4,8 @@
 
 Production URL: https://ai-finance-0plb.onrender.com
 
+For release, smoke-test, and rollback procedures, see [production operations](production-operations.md).
+
 Custom production URL: https://ai-finance-remont.pp.ua
 
 ## Render Web Service
