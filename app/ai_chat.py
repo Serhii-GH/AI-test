@@ -19,10 +19,18 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.ai_actions import (
     ACTION_TYPE_CREATE_TRANSACTION,
+    ACTION_TYPE_DELETE_TRANSACTION,
+    ACTION_TYPE_UPDATE_TRANSACTION,
+    DeleteTransactionActionPayload,
     TransactionActionPayload,
+    UpdateTransactionActionPayload,
     pending_action_response,
 )
-from app.database import create_pending_ai_action, get_transactions
+from app.database import (
+    create_pending_ai_action,
+    get_transactions,
+    transaction_reference_from_record,
+)
 from app.prompts.ai_chat import build_finance_chat_system_prompt
 
 
@@ -196,6 +204,62 @@ def create_finance_chat_graph(
         )
 
     @tool
+    async def find_transactions(
+        query: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: Annotated[int, Field(ge=1, le=10)] = 5,
+    ) -> str:
+        """Find up to 10 project operations and return their IDs and full visible details.
+
+        Use this before proposing an edit or deletion. Provide a short search phrase when the
+        user named an item; omit it only to get the newest operations. Dates must be ISO dates.
+        """
+        try:
+            start, end = _parse_period(start_date, end_date)
+            transactions = await get_transactions(engine, telegram_id, project_id, start, end)
+        except ValueError as error:
+            return _tool_error(str(error))
+
+        normalized_query = (query or "").strip().casefold()
+        if normalized_query:
+            transactions = [
+                item for item in transactions
+                if normalized_query in " ".join(
+                    str(item.get(field) or "")
+                    for field in ("main_category", "subcategory", "description")
+                ).casefold()
+            ]
+        return _json_payload(
+            {
+                "period": _period_payload(start, end),
+                "transactions": [
+                    {
+                        "id": item["id"],
+                        "date": item["created_at"].date().isoformat(),
+                        "type": item["transaction_type"],
+                        "category": item.get("main_category"),
+                        "subcategory": item.get("subcategory"),
+                        "amount": _money(Decimal(str(item["amount"]))),
+                        "exchange_rate": _money(Decimal(str(item["exchange_rate"]))) if item.get("exchange_rate") else None,
+                        "description": item.get("description"),
+                    }
+                    for item in transactions[:limit]
+                ],
+            }
+        )
+
+    async def _get_transaction_reference(transaction_id: int):
+        transactions = await get_transactions(engine, telegram_id, project_id)
+        transaction = next((item for item in transactions if int(item["id"]) == transaction_id), None)
+        if transaction is None:
+            return None
+        try:
+            return transaction_reference_from_record(transaction)
+        except ValueError:
+            return None
+
+    @tool
     async def propose_create_transaction(
         transaction_type: Literal["income", "expense"],
         amount: Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)],
@@ -249,7 +313,93 @@ def create_finance_chat_graph(
             }
         )
 
-    tools = [get_transactions_summary, get_category_totals, get_top_expenses, propose_create_transaction]
+    @tool
+    async def propose_update_transaction(
+        transaction_id: Annotated[int, Field(gt=0)],
+        transaction_type: Literal["income", "expense"],
+        amount: Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)],
+        exchange_rate: Annotated[Decimal, Field(gt=0, max_digits=10, decimal_places=4)],
+        category: Literal["Роботи", "Матеріали"],
+        subcategory: Annotated[str, Field(min_length=1, max_length=100)],
+        description: Annotated[str, Field(min_length=1, max_length=255)],
+        transaction_date: str,
+    ) -> str:
+        """Create a pending proposal to replace one known finance operation.
+
+        Call find_transactions first and use its exact ID. This does NOT update the database;
+        the user must review the old and new values and confirm in the interface.
+        """
+        target = await _get_transaction_reference(transaction_id)
+        if target is None:
+            return _tool_error("Операцію не знайдено або її не можна безпечно змінити.")
+        try:
+            payload = UpdateTransactionActionPayload.model_validate(
+                {
+                    "transaction_id": transaction_id,
+                    "expected": target.model_dump(mode="json"),
+                    "type": transaction_type,
+                    "amount": amount,
+                    "exchange_rate": exchange_rate,
+                    "category": category,
+                    "subcategory": subcategory,
+                    "description": description,
+                    "date": transaction_date,
+                }
+            )
+        except ValidationError:
+            return _tool_error("Неможливо підготувати зміну: перевірте всі поля операції.")
+        try:
+            action = await create_pending_ai_action(
+                engine,
+                telegram_id=telegram_id,
+                project_id=project_id,
+                thread_id=thread_id,
+                action_id=str(uuid4()),
+                action_type=ACTION_TYPE_UPDATE_TRANSACTION,
+                payload=payload.model_dump(mode="json"),
+                payload_hash=payload.canonical_hash(),
+                expires_at=datetime.now(timezone.utc) + PENDING_ACTION_RETENTION,
+            )
+        except Exception:
+            return _tool_error("Не вдалося підготувати чернетку зміни.")
+        return _json_payload({"pending_action": pending_action_response(action).model_dump(mode="json"), "confirmation_required": True})
+
+    @tool
+    async def propose_delete_transaction(transaction_id: Annotated[int, Field(gt=0)]) -> str:
+        """Create a pending proposal to delete one known finance operation.
+
+        Call find_transactions first and use its exact ID. This does NOT delete anything until
+        the user reviews the card and confirms it in the interface.
+        """
+        target = await _get_transaction_reference(transaction_id)
+        if target is None:
+            return _tool_error("Операцію не знайдено або її не можна безпечно видалити.")
+        payload = DeleteTransactionActionPayload(transaction_id=transaction_id, expected=target)
+        try:
+            action = await create_pending_ai_action(
+                engine,
+                telegram_id=telegram_id,
+                project_id=project_id,
+                thread_id=thread_id,
+                action_id=str(uuid4()),
+                action_type=ACTION_TYPE_DELETE_TRANSACTION,
+                payload=payload.model_dump(mode="json"),
+                payload_hash=payload.canonical_hash(),
+                expires_at=datetime.now(timezone.utc) + PENDING_ACTION_RETENTION,
+            )
+        except Exception:
+            return _tool_error("Не вдалося підготувати чернетку видалення.")
+        return _json_payload({"pending_action": pending_action_response(action).model_dump(mode="json"), "confirmation_required": True})
+
+    tools = [
+        get_transactions_summary,
+        get_category_totals,
+        get_top_expenses,
+        find_transactions,
+        propose_create_transaction,
+        propose_update_transaction,
+        propose_delete_transaction,
+    ]
     model = ChatGoogleGenerativeAI(
         model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
         google_api_key=api_key,

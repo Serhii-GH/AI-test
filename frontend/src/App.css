@@ -899,6 +899,7 @@ h2 {
 .position-cell { color: #fffaf0; font-weight: 650; }
 .usd-amount { white-space: nowrap; }
 .usd-amount small { display: block; margin-top: 3px; color: #b8b7aa; font-size: 0.67rem; font-weight: 650; }
+.summary-usd-total { color: #f3d6a5; font-size: 0.91rem; font-weight: 800; }
 
 .type-pill {
   display: inline-flex;
@@ -915,7 +916,7 @@ h2 {
 .amount-heading, .table-amount { text-align: right !important; }
 .table-amount { color: #f09a83; font-weight: 800; white-space: nowrap; }
 .income-amount { color: #b5d3b5; }
-.transaction-action-cell { text-align: right; }
+.transaction-action-cell { display: flex; justify-content: flex-end; gap: 7px; text-align: right; }
 
 .transaction-pagination {
   display: flex;
@@ -949,6 +950,7 @@ h2 {
 .show-more-button:hover,
 .show-all-button:hover { background: rgba(228, 177, 110, 0.24); }
 
+.edit-transaction-button,
 .delete-transaction-button {
   border: 1px solid rgba(240, 154, 131, 0.46);
   border-radius: 7px;
@@ -961,8 +963,17 @@ h2 {
   padding: 7px 10px;
 }
 
+.edit-transaction-button {
+  border-color: rgba(228, 177, 110, 0.46);
+  background: rgba(228, 177, 110, 0.12);
+  color: #f3d6a5;
+}
+
+.edit-transaction-button:hover:not(:disabled) { background: rgba(228, 177, 110, 0.26); }
 .delete-transaction-button:hover:not(:disabled) { background: rgba(198, 91, 63, 0.3); }
+.edit-transaction-button:disabled,
 .delete-transaction-button:disabled { cursor: wait; opacity: 0.62; }
+.edit-transaction-panel { margin-bottom: 20px; }
 
 .empty-state,
 .chart-placeholder,
@@ -1084,6 +1095,7 @@ h2 {
   border-radius: 12px;
   background: linear-gradient(135deg, rgba(228, 177, 110, 0.12), rgba(21, 27, 23, 0.54));
 }
+.pending-action-card-danger { border-color: rgba(240, 154, 131, 0.52); background: linear-gradient(135deg, rgba(198, 91, 63, 0.15), rgba(21, 27, 23, 0.54)); }
 
 .pending-action-heading {
   display: flex;
@@ -1108,6 +1120,9 @@ h2 {
 .pending-action-details dt { color: #bcb5a5; font-size: 0.65rem; font-weight: 800; letter-spacing: 0.075em; text-transform: uppercase; }
 .pending-action-details dd { margin: 4px 0 0; color: #f0eadc; font-size: 0.8rem; line-height: 1.35; overflow-wrap: anywhere; }
 .pending-action-description { grid-column: 1 / -1; }
+.pending-action-transaction-details + .pending-action-transaction-details { margin-top: 14px; padding-top: 14px; border-top: 1px solid rgba(226, 212, 180, 0.15); }
+.pending-action-transaction-details h4 { margin: 14px 0 0; color: #d8d2c2; font-size: 0.76rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
+.pending-action-transaction-details h4 + .pending-action-details { margin-top: 9px; }
 
 .pending-action-buttons { display: flex; flex-wrap: wrap; gap: 9px; }
 .confirm-action-button,

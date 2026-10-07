@@ -32,7 +32,15 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
-from app.ai_actions import ACTION_TYPE_CREATE_TRANSACTION, TransactionActionPayload
+from app.ai_actions import (
+    ACTION_TYPE_CREATE_TRANSACTION,
+    ACTION_TYPE_DELETE_TRANSACTION,
+    ACTION_TYPE_UPDATE_TRANSACTION,
+    DeleteTransactionActionPayload,
+    TransactionActionPayload,
+    TransactionReference,
+    UpdateTransactionActionPayload,
+)
 
 metadata = MetaData()
 DEFAULT_PROJECT_NAME = "Фінансовий огляд ремонту 1-кімнатної квартири в ЖК Нова Англія"
@@ -523,6 +531,36 @@ async def initialize_database(engine: AsyncEngine) -> None:
         )
 
 
+async def _get_or_create_category_id(
+    connection: AsyncConnection,
+    *,
+    user_id: int,
+    main_category_name: str,
+    subcategory_name: str,
+) -> int:
+    """Return the two-level category ID, creating the hierarchy when required."""
+    main_category_id = await connection.scalar(
+        insert(categories)
+        .values(user_id=user_id, parent_id=None, name=main_category_name)
+        .on_conflict_do_update(
+            index_elements=[categories.c.user_id, categories.c.name],
+            index_where=categories.c.parent_id.is_(None),
+            set_={"name": main_category_name},
+        )
+        .returning(categories.c.id)
+    )
+    subcategory_id = await connection.scalar(
+        insert(categories)
+        .values(user_id=user_id, parent_id=main_category_id, name=subcategory_name)
+        .on_conflict_do_update(
+            index_elements=[categories.c.user_id, categories.c.parent_id, categories.c.name],
+            set_={"name": subcategory_name},
+        )
+        .returning(categories.c.id)
+    )
+    return int(subcategory_id)
+
+
 async def _save_transaction_in_connection(
     connection: AsyncConnection,
     *,
@@ -538,33 +576,11 @@ async def _save_transaction_in_connection(
     source_action_id: str | None = None,
 ) -> dict[str, object]:
     """Create one transaction using an existing DB transaction."""
-    main_category_id = await connection.scalar(
-        insert(categories)
-        .values(user_id=user_id, parent_id=None, name=main_category_name)
-        .on_conflict_do_update(
-            index_elements=[categories.c.user_id, categories.c.name],
-            index_where=categories.c.parent_id.is_(None),
-            set_={"name": main_category_name},
-        )
-        .returning(categories.c.id)
-    )
-
-    subcategory_id = await connection.scalar(
-        insert(categories)
-        .values(
-            user_id=user_id,
-            parent_id=main_category_id,
-            name=subcategory_name,
-        )
-        .on_conflict_do_update(
-            index_elements=[
-                categories.c.user_id,
-                categories.c.parent_id,
-                categories.c.name,
-            ],
-            set_={"name": subcategory_name},
-        )
-        .returning(categories.c.id)
+    subcategory_id = await _get_or_create_category_id(
+        connection,
+        user_id=user_id,
+        main_category_name=main_category_name,
+        subcategory_name=subcategory_name,
     )
 
     transaction_values: dict[str, object] = {
@@ -658,6 +674,163 @@ async def save_transaction(
             exchange_rate=exchange_rate,
             created_at=created_at,
             project_id=int(project_id),
+        )
+
+
+async def _get_project_transaction_in_connection(
+    connection: AsyncConnection,
+    *,
+    user_id: int,
+    project_id: int,
+    transaction_id: int,
+    lock: bool = False,
+) -> dict[str, object] | None:
+    """Read one owned transaction with its category names, optionally locking it."""
+    main_categories = categories.alias("main_categories")
+    statement = (
+        select(
+            transactions.c.id,
+            transactions.c.user_id,
+            transactions.c.project_id,
+            transactions.c.category_id,
+            transactions.c.transaction_type,
+            main_categories.c.name.label("main_category"),
+            categories.c.name.label("subcategory"),
+            transactions.c.amount,
+            transactions.c.exchange_rate,
+            transactions.c.amount_usd,
+            transactions.c.description,
+            transactions.c.created_at,
+        )
+        .select_from(
+            transactions.join(categories, transactions.c.category_id == categories.c.id).outerjoin(
+                main_categories,
+                categories.c.parent_id == main_categories.c.id,
+            )
+        )
+        .where(
+            transactions.c.id == transaction_id,
+            transactions.c.user_id == user_id,
+            transactions.c.project_id == project_id,
+        )
+    )
+    if lock:
+        statement = statement.with_for_update(of=transactions)
+    result = await connection.execute(statement)
+    row = result.mappings().one_or_none()
+    return dict(row) if row is not None else None
+
+
+def transaction_reference_from_record(transaction: dict[str, object]) -> TransactionReference:
+    """Create a stable snapshot for a user-visible, confirmable AI action."""
+    exchange_rate = transaction.get("exchange_rate")
+    main_category = transaction.get("main_category")
+    if exchange_rate is None or main_category not in {"Роботи", "Матеріали"}:
+        raise ValueError("Transaction cannot be safely proposed for an AI change.")
+    created_at = transaction["created_at"]
+    if not isinstance(created_at, datetime):
+        raise ValueError("Transaction has an invalid date.")
+    return TransactionReference.model_validate(
+        {
+            "id": transaction["id"],
+            "type": transaction["transaction_type"],
+            "amount": transaction["amount"],
+            "exchange_rate": exchange_rate,
+            "category": main_category,
+            "subcategory": transaction["subcategory"],
+            "description": transaction["description"],
+            "date": created_at.date(),
+        }
+    )
+
+
+async def _update_transaction_in_connection(
+    connection: AsyncConnection,
+    *,
+    user_id: int,
+    project_id: int,
+    transaction_id: int,
+    payload: TransactionActionPayload,
+) -> dict[str, object] | None:
+    """Replace one owned operation using the same validation path as creation."""
+    target_id = await connection.scalar(
+        select(transactions.c.id)
+        .where(
+            transactions.c.id == transaction_id,
+            transactions.c.user_id == user_id,
+            transactions.c.project_id == project_id,
+        )
+        .with_for_update()
+    )
+    if target_id is None:
+        return None
+    category_id = await _get_or_create_category_id(
+        connection,
+        user_id=user_id,
+        main_category_name=payload.category,
+        subcategory_name=payload.subcategory,
+    )
+    amount_usd = (payload.amount / payload.exchange_rate).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
+    result = await connection.execute(
+        update(transactions)
+        .where(
+            transactions.c.id == transaction_id,
+            transactions.c.user_id == user_id,
+            transactions.c.project_id == project_id,
+        )
+        .values(
+            category_id=category_id,
+            transaction_type=payload.type,
+            amount=payload.amount,
+            exchange_rate=payload.exchange_rate,
+            amount_usd=amount_usd,
+            description=payload.description,
+            created_at=datetime.combine(payload.date, datetime.min.time(), tzinfo=timezone.utc),
+        )
+        .returning(
+            transactions.c.id,
+            transactions.c.user_id,
+            transactions.c.project_id,
+            transactions.c.category_id,
+            transactions.c.transaction_type,
+            transactions.c.amount,
+            transactions.c.exchange_rate,
+            transactions.c.amount_usd,
+            transactions.c.description,
+            transactions.c.created_at,
+        )
+    )
+    updated = result.mappings().one_or_none()
+    if updated is None:
+        return None
+    transaction = dict(updated)
+    transaction["main_category"] = payload.category
+    transaction["subcategory"] = payload.subcategory
+    return transaction
+
+
+async def update_user_transaction(
+    engine: AsyncEngine,
+    *,
+    telegram_id: int,
+    project_id: int,
+    transaction_id: int,
+    payload: TransactionActionPayload,
+) -> dict[str, object] | None:
+    """Manually update one transaction only when it belongs to the authenticated owner."""
+    async with engine.begin() as connection:
+        user_id = await connection.scalar(select(users.c.id).where(users.c.telegram_id == telegram_id))
+        if user_id is None:
+            return None
+        return await _update_transaction_in_connection(
+            connection,
+            user_id=int(user_id),
+            project_id=project_id,
+            transaction_id=transaction_id,
+            payload=payload,
         )
 
 
@@ -1425,18 +1598,43 @@ async def _get_transaction_by_source_action(
     return dict(transaction) if transaction is not None else None
 
 
-async def confirm_pending_create_transaction_action(
+async def _fail_pending_ai_action_in_connection(
+    connection: AsyncConnection,
+    *,
+    action: dict[str, object],
+    action_id: str,
+    now: datetime,
+    reason: str,
+) -> dict[str, object]:
+    """Mark an invalid or stale AI action as failed and preserve an audit trail."""
+    await connection.execute(
+        update(pending_ai_actions)
+        .where(pending_ai_actions.c.id == action_id, pending_ai_actions.c.status == "pending")
+        .values(status="failed", updated_at=now)
+    )
+    await connection.execute(
+        insert(ai_action_audit_log).values(
+            user_id=action["user_id"],
+            project_id=action["project_id"],
+            thread_id=action["thread_id"],
+            action_id=action_id,
+            action_type=action["action_type"],
+            event="failed",
+            result={"reason": reason},
+        )
+    )
+    action.update(status="failed", updated_at=now)
+    return action
+
+
+async def confirm_pending_ai_action(
     engine: AsyncEngine,
     *,
     telegram_id: int,
     project_id: int,
     action_id: str,
 ) -> tuple[dict[str, object] | None, dict[str, object] | None, bool]:
-    """Atomically execute an owned pending transaction action exactly once.
-
-    The returned boolean is true when a previous successful confirmation is replayed.
-    A malformed action is marked failed and returned without a transaction.
-    """
+    """Atomically execute one owned, user-confirmed AI proposal exactly once."""
     now = datetime.now(timezone.utc)
     async with engine.begin() as connection:
         result = await connection.execute(
@@ -1453,81 +1651,100 @@ async def confirm_pending_create_transaction_action(
         if action_row is None:
             return None, None, False
         action = dict(action_row)
+        action_type = str(action["action_type"])
 
         if action["status"] == "confirmed":
-            transaction = await _get_transaction_by_source_action(connection, action_id)
-            if transaction is None:
-                raise RuntimeError("Confirmed AI action has no source transaction.")
-            return action, transaction, True
+            if action_type == ACTION_TYPE_CREATE_TRANSACTION:
+                return action, await _get_transaction_by_source_action(connection, action_id), True
+            if action_type == ACTION_TYPE_UPDATE_TRANSACTION:
+                try:
+                    payload = UpdateTransactionActionPayload.model_validate(action["payload"])
+                except ValidationError:
+                    return action, None, True
+                transaction = await _get_project_transaction_in_connection(
+                    connection,
+                    user_id=int(action["user_id"]),
+                    project_id=int(action["project_id"]),
+                    transaction_id=payload.transaction_id,
+                )
+                return action, transaction, True
+            return action, None, True
 
         if action["status"] != "pending" or action["expires_at"] <= now:
             return None, None, False
-        if action["action_type"] != ACTION_TYPE_CREATE_TRANSACTION:
-            await connection.execute(
-                update(pending_ai_actions)
-                .where(pending_ai_actions.c.id == action_id, pending_ai_actions.c.status == "pending")
-                .values(status="failed", updated_at=now)
-            )
-            await connection.execute(
-                insert(ai_action_audit_log).values(
-                    user_id=action["user_id"],
-                    project_id=action["project_id"],
-                    thread_id=action["thread_id"],
-                    action_id=action_id,
-                    action_type=action["action_type"],
-                    event="failed",
-                    result={"reason": "unsupported_action_type"},
-                )
-            )
-            action.update(status="failed", updated_at=now)
-            return action, None, False
-
-        try:
-            payload = TransactionActionPayload.model_validate(action["payload"])
-        except ValidationError as error:
-            await connection.execute(
-                update(pending_ai_actions)
-                .where(pending_ai_actions.c.id == action_id, pending_ai_actions.c.status == "pending")
-                .values(status="failed", updated_at=now)
-            )
-            await connection.execute(
-                insert(ai_action_audit_log).values(
-                    user_id=action["user_id"],
-                    project_id=action["project_id"],
-                    thread_id=action["thread_id"],
-                    action_id=action_id,
-                    action_type=action["action_type"],
-                    event="failed",
-                    result={"reason": "invalid_payload"},
-                )
-            )
-            action.update(status="failed", updated_at=now)
-            return action, None, False
+        if action_type not in {
+            ACTION_TYPE_CREATE_TRANSACTION,
+            ACTION_TYPE_UPDATE_TRANSACTION,
+            ACTION_TYPE_DELETE_TRANSACTION,
+        }:
+            return await _fail_pending_ai_action_in_connection(
+                connection, action=action, action_id=action_id, now=now, reason="unsupported_action_type"
+            ), None, False
 
         await connection.execute(
             insert(ai_action_audit_log).values(
-                user_id=action["user_id"],
-                project_id=action["project_id"],
-                thread_id=action["thread_id"],
-                action_id=action_id,
-                action_type=action["action_type"],
-                event="confirm_requested",
-                result={"status": "processing"},
+                user_id=action["user_id"], project_id=action["project_id"], thread_id=action["thread_id"],
+                action_id=action_id, action_type=action_type, event="confirm_requested", result={"status": "processing"},
             )
         )
-        transaction = await _save_transaction_in_connection(
-            connection,
-            user_id=int(action["user_id"]),
-            project_id=int(action["project_id"]),
-            amount=payload.amount,
-            main_category_name=payload.category,
-            subcategory_name=payload.subcategory,
-            description=payload.description,
-            transaction_type=payload.type,
-            exchange_rate=payload.exchange_rate,
-            created_at=datetime.combine(payload.date, datetime.min.time(), tzinfo=timezone.utc),
-            source_action_id=action_id,
-        )
+
+        try:
+            if action_type == ACTION_TYPE_CREATE_TRANSACTION:
+                payload = TransactionActionPayload.model_validate(action["payload"])
+                transaction = await _save_transaction_in_connection(
+                    connection,
+                    user_id=int(action["user_id"]),
+                    project_id=int(action["project_id"]),
+                    amount=payload.amount,
+                    main_category_name=payload.category,
+                    subcategory_name=payload.subcategory,
+                    description=payload.description,
+                    transaction_type=payload.type,
+                    exchange_rate=payload.exchange_rate,
+                    created_at=datetime.combine(payload.date, datetime.min.time(), tzinfo=timezone.utc),
+                    source_action_id=action_id,
+                )
+                audit_result: dict[str, object] = {"transaction_id": int(transaction["id"])}
+            elif action_type == ACTION_TYPE_UPDATE_TRANSACTION:
+                payload = UpdateTransactionActionPayload.model_validate(action["payload"])
+                current = await _get_project_transaction_in_connection(
+                    connection,
+                    user_id=int(action["user_id"]), project_id=int(action["project_id"]),
+                    transaction_id=payload.transaction_id, lock=True,
+                )
+                if current is None or transaction_reference_from_record(current) != payload.expected:
+                    return await _fail_pending_ai_action_in_connection(
+                        connection, action=action, action_id=action_id, now=now, reason="stale_or_missing_target"
+                    ), None, False
+                transaction = await _update_transaction_in_connection(
+                    connection,
+                    user_id=int(action["user_id"]), project_id=int(action["project_id"]),
+                    transaction_id=payload.transaction_id, payload=payload,
+                )
+                if transaction is None:
+                    return await _fail_pending_ai_action_in_connection(
+                        connection, action=action, action_id=action_id, now=now, reason="missing_target"
+                    ), None, False
+                audit_result = {"transaction_id": int(transaction["id"])}
+            else:
+                payload = DeleteTransactionActionPayload.model_validate(action["payload"])
+                current = await _get_project_transaction_in_connection(
+                    connection,
+                    user_id=int(action["user_id"]), project_id=int(action["project_id"]),
+                    transaction_id=payload.transaction_id, lock=True,
+                )
+                if current is None or transaction_reference_from_record(current) != payload.expected:
+                    return await _fail_pending_ai_action_in_connection(
+                        connection, action=action, action_id=action_id, now=now, reason="stale_or_missing_target"
+                    ), None, False
+                await connection.execute(delete(transactions).where(transactions.c.id == payload.transaction_id))
+                transaction = None
+                audit_result = {"deleted_transaction_id": payload.transaction_id}
+        except (ValidationError, ValueError):
+            return await _fail_pending_ai_action_in_connection(
+                connection, action=action, action_id=action_id, now=now, reason="invalid_payload"
+            ), None, False
+
         await connection.execute(
             update(pending_ai_actions)
             .where(pending_ai_actions.c.id == action_id, pending_ai_actions.c.status == "pending")
@@ -1535,13 +1752,8 @@ async def confirm_pending_create_transaction_action(
         )
         await connection.execute(
             insert(ai_action_audit_log).values(
-                user_id=action["user_id"],
-                project_id=action["project_id"],
-                thread_id=action["thread_id"],
-                action_id=action_id,
-                action_type=action["action_type"],
-                event="confirmed",
-                result={"transaction_id": int(transaction["id"])},
+                user_id=action["user_id"], project_id=action["project_id"], thread_id=action["thread_id"],
+                action_id=action_id, action_type=action_type, event="confirmed", result=audit_result,
             )
         )
         action.update(status="confirmed", confirmed_at=now, updated_at=now)
@@ -1729,10 +1941,19 @@ async def get_financial_summary(
         ),
         0,
     ).label("total_expense")
+    total_expense_usd = func.coalesce(
+        func.sum(
+            case(
+                (transactions.c.transaction_type == "expense", transactions.c.amount_usd),
+                else_=0,
+            )
+        ),
+        0,
+    ).label("total_expense_usd")
 
     async with engine.connect() as connection:
         statement = (
-            select(total_income, total_expense)
+            select(total_income, total_expense, total_expense_usd)
             .select_from(transactions.join(users))
             .where(users.c.telegram_id == telegram_id, transactions.c.project_id == project_id)
         )
@@ -1740,9 +1961,11 @@ async def get_financial_summary(
         row = result.mappings().one()
         income = Decimal(row["total_income"])
         expense = Decimal(row["total_expense"])
+        expense_usd = Decimal(row["total_expense_usd"])
         return {
             "total_income": income,
             "total_expense": expense,
+            "total_expense_usd": expense_usd,
             "balance": income - expense,
         }
 
